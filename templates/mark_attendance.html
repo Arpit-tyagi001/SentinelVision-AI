@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Mark Attendance{% endblock %}
+{% block content %}
+<div class="card">
+    <h2>Mark Attendance</h2>
+    <p>Click "Start Camera" to begin face recognition.</p>
+    <div class="video-container">
+        <video id="video" autoplay playsinline></video>
+        <canvas id="canvas" style="display:none;"></canvas>
+    </div>
+    <div>
+        <button id="startCam" class="btn primary">▶ Start Camera</button>
+        <button id="stopCam" class="btn danger">⏹ Stop</button>
+        <button id="markBtn" class="btn success">✅ Mark Present</button>
+    </div>
+    <div id="attendanceResult"></div>
+</div>
+{% endblock %}

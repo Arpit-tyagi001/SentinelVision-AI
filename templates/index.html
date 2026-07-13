@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}Home{% endblock %}
+{% block content %}
+<div class="hero">
+    <h1>Welcome to Face Recognition Attendance</h1>
+    <p>Automatic attendance marking using facial recognition.</p>
+    <div class="buttons">
+        <a href="{{ url_for('register') }}" class="btn primary">Register Student</a>
+        <a href="{{ url_for('mark_attendance') }}" class="btn secondary">Mark Attendance</a>
+    </div>
+</div>
+{% endblock %}

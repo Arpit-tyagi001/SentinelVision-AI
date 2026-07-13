@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+{% block content %}
+<div class="card">
+    <h2>Attendance Dashboard</h2>
+    <p>Summary and reports will appear here.</p>
+    <table>
+        <thead>
+            <tr><th>Roll No</th><th>Name</th><th>Date</th><th>Status</th></tr>
+        </thead>
+        <tbody>
+            <tr><td colspan="4">No data yet.</td></tr>
+        </tbody>
+    </table>
+    <button class="btn secondary">📊 Export to Excel</button>
+</div>
+{% endblock %}
