@@ -24,3 +24,88 @@ An AI-powered face recognition based attendance management system built with **P
 ---
 
 ## 📂 Project Structure
+face-attendance-recognition-system/
+│
+├── static/
+│   ├── style.css
+│   └── script.js
+│
+├── templates/
+│   ├── base.html
+│   ├── index.html
+│   ├── register.html
+│   ├── mark_attendance.html
+│   └── dashboard.html
+│
+├── app.py
+├── database.db
+├── requirements.txt
+└── README.md
+
+---
+
+## ⚙️ Setup Instructions
+
+### 1. Clone the repository
+```bash
+git clone https://github.com/Shlokverma0/face-attendance-recognition-system.git
+cd face-attendance-recognition-system
+```
+
+### 2. Create a virtual environment
+```bash
+python -m venv venv
+```
+
+### 3. Activate the virtual environment
+
+**Windows:**
+```bash
+venv\Scripts\activate
+```
+
+**Mac/Linux:**
+```bash
+source venv/bin/activate
+```
+
+### 4. Install dependencies
+```bash
+pip install -r requirements.txt
+```
+
+⚠️ **Note:** If you get a `pkg_resources` error while installing `face_recognition`, run these commands:
+```bash
+pip install "setuptools<81"
+pip install git+https://github.com/ageitgey/face_recognition_models
+```
+
+### 5. Run the application
+```bash
+python app.py
+```
+
+### 6. Open in browser
+http://127.0.0.1:5000
+
+---
+
+## 📖 How to Use
+
+1. Go to **Register** page → Start Camera → Capture 5 Images → Fill details → Click Register
+2. Go to **Mark Attendance** page → Start Camera → Click Mark Present
+3. Go to **Dashboard** page → View all attendance records
+
+---
+
+## 👥 Contributors
+
+- Shlok Verma
+- Arpit Tyagi
+
+---
+
+## 📄 License
+
+This project is open source and available for educational purposes.
+Steps:
