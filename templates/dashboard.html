@@ -6,10 +6,30 @@
     <p>Summary and reports will appear here.</p>
     <table>
         <thead>
-            <tr><th>Roll No</th><th>Name</th><th>Date</th><th>Status</th></tr>
+            <tr>
+                <th>Roll No</th>
+                <th>Name</th>
+                <th>Class</th>
+                <th>Date</th>
+                <th>Time</th>
+                <th>Status</th>
+            </tr>
         </thead>
         <tbody>
-            <tr><td colspan="4">No data yet.</td></tr>
+            {% if records %}
+                {% for record in records %}
+                <tr>
+                    <td>{{ record[1] }}</td>
+                    <td>{{ record[0] }}</td>
+                    <td>{{ record[2] }}</td>
+                    <td>{{ record[3] }}</td>
+                    <td>{{ record[4] }}</td>
+                    <td>{{ record[5] }}</td>
+                </tr>
+                {% endfor %}
+            {% else %}
+                <tr><td colspan="6">No data yet.</td></tr>
+            {% endif %}
         </tbody>
     </table>
     <button class="btn secondary">📊 Export to Excel</button>
