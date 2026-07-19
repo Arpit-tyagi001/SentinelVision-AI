@@ -107,72 +107,103 @@ def mark_attendance():
     image_data = data.get('image')
 
     if not image_data:
-        return jsonify({'message': 'Image nahi mili'})
+        return jsonify({'faces': [], 'error': 'Image nahi mili'})
 
     try:
         img_array = decode_base64_image(image_data)
+        # Detect ALL faces in the frame (multi-face support)
         face_locations = face_recognition.face_locations(img_array)
 
         if len(face_locations) == 0:
-            return jsonify({'message': 'Koi face detect nahi hua.'})
+            return jsonify({'faces': [], 'message': 'Koi face detect nahi hua.'})
 
         face_encs = face_recognition.face_encodings(img_array, face_locations)
-        if len(face_encs) == 0:
-            return jsonify({'message': 'Face encode nahi ho paya.'})
-
-        current_encoding = face_encs[0]
 
         conn = sqlite3.connect('database.db')
         c = conn.cursor()
         c.execute('SELECT id, name, roll_no, class, face_encoding FROM students')
         students = c.fetchall()
 
-        best_match = None
-        best_distance = 0.6
-
+        # Pre-decode all saved encodings once (faster than re-loading per face)
+        known = []
         for student_id, name, roll_no, student_class, encoding_blob in students:
-            saved_encoding = pickle.loads(encoding_blob)
-            distance = np.linalg.norm(saved_encoding - current_encoding)
-            if distance < best_distance:
-                best_distance = distance
-                best_match = (student_id, name, roll_no, student_class)
-
-        if best_match is None:
-            conn.close()
-            return jsonify({'message': 'Face match nahi hua. Pehle register karo!'})
-
-        student_id, name, roll_no, student_class = best_match
+            known.append((student_id, name, roll_no, student_class, pickle.loads(encoding_blob)))
 
         today = datetime.now().strftime('%Y-%m-%d')
         now_time = datetime.now().strftime('%H:%M:%S')
 
-        c.execute('SELECT * FROM attendance WHERE student_id = ? AND date = ?', (student_id, today))
-        existing = c.fetchone()
+        results = []
 
-        if existing:
-            conn.close()
-            return jsonify({'message': name + ' ki attendance aaj pehle se mark hai.'})
+        for (top, right, bottom, left), current_encoding in zip(face_locations, face_encs):
+            best_match = None
+            best_distance = 0.6  # recognition threshold
 
-        c.execute('INSERT INTO attendance (student_id, date, time, status) VALUES (?, ?, ?, ?)', (student_id, today, now_time, 'Present'))
-        conn.commit()
+            for student_id, name, roll_no, student_class, saved_encoding in known:
+                distance = np.linalg.norm(saved_encoding - current_encoding)
+                if distance < best_distance:
+                    best_distance = distance
+                    best_match = (student_id, name, roll_no, student_class)
+
+            face_result = {
+                'box': [top, right, bottom, left]
+            }
+
+            if best_match is None:
+                face_result['name'] = 'Unknown'
+                face_result['status'] = 'unknown'
+                face_result['message'] = 'Face match nahi hua. Pehle register karo!'
+                results.append(face_result)
+                continue
+
+            student_id, name, roll_no, student_class = best_match
+            face_result['name'] = name
+            face_result['roll_no'] = roll_no
+
+            # Check if already marked today
+            c.execute('SELECT * FROM attendance WHERE student_id = ? AND date = ?', (student_id, today))
+            existing = c.fetchone()
+
+            if existing:
+                face_result['status'] = 'already_marked'
+                face_result['message'] = name + ' ki attendance aaj pehle se mark hai.'
+            else:
+                c.execute('INSERT INTO attendance (student_id, date, time, status) VALUES (?, ?, ?, ?)', (student_id, today, now_time, 'Present'))
+                conn.commit()
+                face_result['status'] = 'marked'
+                face_result['message'] = '✅ ' + name + ' - Attendance marked! Time: ' + now_time
+
+            results.append(face_result)
+
         conn.close()
-
-        return jsonify({'message': name + ' - Attendance marked! Time: ' + now_time})
+        return jsonify({'faces': results})
 
     except Exception as e:
         print(e)
-        return jsonify({'message': 'Error: ' + str(e)})
+        return jsonify({'faces': [], 'error': str(e)})
 
 
 @app.route('/dashboard')
 def dashboard():
     conn = sqlite3.connect('database.db')
     c = conn.cursor()
-    query = "SELECT students.name, students.roll_no, students.class, attendance.date, attendance.time, attendance.status FROM attendance JOIN students ON attendance.student_id = students.id ORDER BY attendance.date DESC"
+    query = "SELECT attendance.id, students.name, students.roll_no, students.class, attendance.date, attendance.time, attendance.status FROM attendance JOIN students ON attendance.student_id = students.id ORDER BY attendance.date DESC"
     c.execute(query)
     records = c.fetchall()
     conn.close()
     return render_template('dashboard.html', records=records)
+
+
+@app.route('/delete-attendance/<int:attendance_id>', methods=['POST'])
+def delete_attendance(attendance_id):
+    try:
+        conn = sqlite3.connect('database.db')
+        c = conn.cursor()
+        c.execute('DELETE FROM attendance WHERE id = ?', (attendance_id,))
+        conn.commit()
+        conn.close()
+        return jsonify({'success': True, 'message': 'Record deleted successfully'})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)})
 
 
 if __name__ == '__main__':

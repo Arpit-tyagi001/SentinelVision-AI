@@ -13,22 +13,26 @@
                 <th>Date</th>
                 <th>Time</th>
                 <th>Status</th>
+                <th>Action</th>
             </tr>
         </thead>
-        <tbody>
+        <tbody id="attendanceTableBody">
             {% if records %}
                 {% for record in records %}
-                <tr>
-                    <td>{{ record[1] }}</td>
-                    <td>{{ record[0] }}</td>
+                <tr id="row-{{ record[0] }}">
                     <td>{{ record[2] }}</td>
+                    <td>{{ record[1] }}</td>
                     <td>{{ record[3] }}</td>
                     <td>{{ record[4] }}</td>
                     <td>{{ record[5] }}</td>
+                    <td>{{ record[6] }}</td>
+                    <td>
+                        <button class="btn danger delete-btn" data-id="{{ record[0] }}">🗑️ Delete</button>
+                    </td>
                 </tr>
                 {% endfor %}
             {% else %}
-                <tr><td colspan="6">No data yet.</td></tr>
+                <tr><td colspan="7">No data yet.</td></tr>
             {% endif %}
         </tbody>
     </table>
