@@ -16,6 +16,11 @@
                     <li><a href="{{ url_for('register') }}">Register</a></li>
                     <li><a href="{{ url_for('mark_attendance') }}">Mark Attendance</a></li>
                     <li><a href="{{ url_for('dashboard') }}">Dashboard</a></li>
+                    {% if session.get('logged_in') %}
+                    <li><a href="{{ url_for('logout') }}">Logout ({{ session.get('username') }})</a></li>
+                    {% else %}
+                    <li><a href="{{ url_for('login') }}">Login</a></li>
+                    {% endif %}
                 </ul>
             </nav>
         </div>

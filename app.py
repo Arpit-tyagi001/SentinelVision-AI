@@ -1,4 +1,5 @@
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, session, redirect, url_for
+from functools import wraps
 import sqlite3
 import base64
 import numpy as np
@@ -9,10 +10,25 @@ from io import BytesIO
 from PIL import Image
 
 app = Flask(__name__)
+app.secret_key = 'shlok-face-attendance-secret-key-2026'  # used to sign the session cookie
+
+# ---- Admin credentials ----
+ADMIN_USERNAME = 'shlokverma'
+ADMIN_PASSWORD = 'Shlok2026'
+
+
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get('logged_in'):
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated
+
 
 def init_db():
     print("Database setup start kar raha hoon...")
-    conn = sqlite3.connect('database.db')
+    conn = sqlite3.connect('database.db', timeout=10)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS students (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -48,7 +64,30 @@ def index():
     return render_template('index.html')
 
 
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'GET':
+        return render_template('login.html')
+
+    username = request.form.get('username')
+    password = request.form.get('password')
+
+    if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
+        session['logged_in'] = True
+        session['username'] = username
+        return redirect(url_for('dashboard'))
+    else:
+        return render_template('login.html', error='Galat username ya password!')
+
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
+
+
 @app.route('/register', methods=['GET', 'POST'])
+@login_required
 def register():
     if request.method == 'GET':
         return render_template('register.html')
@@ -86,7 +125,7 @@ def register():
     encoding_blob = pickle.dumps(avg_encoding)
 
     try:
-        conn = sqlite3.connect('database.db')
+        conn = sqlite3.connect('database.db', timeout=10)
         c = conn.cursor()
         c.execute('INSERT INTO students (name, roll_no, class, face_encoding) VALUES (?, ?, ?, ?)', (name, roll_no, student_class, encoding_blob))
         conn.commit()
@@ -119,7 +158,7 @@ def mark_attendance():
 
         face_encs = face_recognition.face_encodings(img_array, face_locations)
 
-        conn = sqlite3.connect('database.db')
+        conn = sqlite3.connect('database.db', timeout=10)
         c = conn.cursor()
         c.execute('SELECT id, name, roll_no, class, face_encoding FROM students')
         students = c.fetchall()
@@ -183,8 +222,9 @@ def mark_attendance():
 
 
 @app.route('/dashboard')
+@login_required
 def dashboard():
-    conn = sqlite3.connect('database.db')
+    conn = sqlite3.connect('database.db', timeout=10)
     c = conn.cursor()
     query = "SELECT attendance.id, students.name, students.roll_no, students.class, attendance.date, attendance.time, attendance.status FROM attendance JOIN students ON attendance.student_id = students.id ORDER BY attendance.date DESC"
     c.execute(query)
@@ -194,9 +234,10 @@ def dashboard():
 
 
 @app.route('/delete-attendance/<int:attendance_id>', methods=['POST'])
+@login_required
 def delete_attendance(attendance_id):
     try:
-        conn = sqlite3.connect('database.db')
+        conn = sqlite3.connect('database.db', timeout=10)
         c = conn.cursor()
         c.execute('DELETE FROM attendance WHERE id = ?', (attendance_id,))
         conn.commit()
