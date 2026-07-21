@@ -37,11 +37,13 @@ def init_db():
         class TEXT NOT NULL,
         face_encoding BLOB NOT NULL
     )''')
+    # NOTE: entry_time / exit_time replace the old single "time" column.
     c.execute('''CREATE TABLE IF NOT EXISTS attendance (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         student_id INTEGER NOT NULL,
         date DATE NOT NULL,
-        time TIME NOT NULL,
+        entry_time TIME,
+        exit_time TIME,
         status TEXT DEFAULT 'Present'
     )''')
     conn.commit()
@@ -137,8 +139,40 @@ def register():
         return jsonify({'success': False, 'message': 'Database error: ' + str(e)})
 
 
+def match_faces(img_array, known):
+    """Run face detection + matching against known encodings. Returns list of
+    (box, student_tuple_or_None) pairs."""
+    face_locations = face_recognition.face_locations(img_array)
+    if len(face_locations) == 0:
+        return []
+
+    face_encs = face_recognition.face_encodings(img_array, face_locations)
+    matches = []
+
+    for (top, right, bottom, left), current_encoding in zip(face_locations, face_encs):
+        best_match = None
+        best_distance = 0.6  # recognition threshold
+
+        for student_id, name, roll_no, student_class, saved_encoding in known:
+            distance = np.linalg.norm(saved_encoding - current_encoding)
+            if distance < best_distance:
+                best_distance = distance
+                best_match = (student_id, name, roll_no, student_class)
+
+        matches.append(([top, right, bottom, left], best_match))
+
+    return matches
+
+
 @app.route('/mark-attendance', methods=['GET', 'POST'])
 def mark_attendance():
+    """Single camera page. Automatically decides ENTRY vs EXIT per person:
+    - No record today yet -> mark entry
+    - Entry exists, no exit yet -> mark exit
+    - Both entry & exit already done -> mark a fresh re-entry (new cycle)
+    A cooldown prevents the same person from toggling entry/exit every
+    couple seconds just by standing in front of the camera.
+    """
     if request.method == 'GET':
         return render_template('mark_attendance.html')
 
@@ -148,44 +182,37 @@ def mark_attendance():
     if not image_data:
         return jsonify({'faces': [], 'error': 'Image nahi mili'})
 
+    # Minimum gap (in seconds) required between an entry and the next
+    # exit/entry action for the same person, so a person standing in
+    # front of the camera doesn't get marked in and out repeatedly.
+    COOLDOWN_SECONDS = 60
+
     try:
         img_array = decode_base64_image(image_data)
-        # Detect ALL faces in the frame (multi-face support)
-        face_locations = face_recognition.face_locations(img_array)
-
-        if len(face_locations) == 0:
-            return jsonify({'faces': [], 'message': 'Koi face detect nahi hua.'})
-
-        face_encs = face_recognition.face_encodings(img_array, face_locations)
 
         conn = sqlite3.connect('database.db', timeout=10)
         c = conn.cursor()
         c.execute('SELECT id, name, roll_no, class, face_encoding FROM students')
         students = c.fetchall()
 
-        # Pre-decode all saved encodings once (faster than re-loading per face)
         known = []
         for student_id, name, roll_no, student_class, encoding_blob in students:
             known.append((student_id, name, roll_no, student_class, pickle.loads(encoding_blob)))
 
+        matches = match_faces(img_array, known)
+
+        if len(matches) == 0:
+            conn.close()
+            return jsonify({'faces': [], 'message': 'Koi face detect nahi hua.'})
+
         today = datetime.now().strftime('%Y-%m-%d')
-        now_time = datetime.now().strftime('%H:%M:%S')
+        now_dt = datetime.now()
+        now_time = now_dt.strftime('%H:%M:%S')
 
         results = []
 
-        for (top, right, bottom, left), current_encoding in zip(face_locations, face_encs):
-            best_match = None
-            best_distance = 0.6  # recognition threshold
-
-            for student_id, name, roll_no, student_class, saved_encoding in known:
-                distance = np.linalg.norm(saved_encoding - current_encoding)
-                if distance < best_distance:
-                    best_distance = distance
-                    best_match = (student_id, name, roll_no, student_class)
-
-            face_result = {
-                'box': [top, right, bottom, left]
-            }
+        for box, best_match in matches:
+            face_result = {'box': box}
 
             if best_match is None:
                 face_result['name'] = 'Unknown'
@@ -198,18 +225,62 @@ def mark_attendance():
             face_result['name'] = name
             face_result['roll_no'] = roll_no
 
-            # Check if already marked today
-            c.execute('SELECT * FROM attendance WHERE student_id = ? AND date = ?', (student_id, today))
+            # Get the most recent row for this student today
+            c.execute(
+                'SELECT id, entry_time, exit_time FROM attendance '
+                'WHERE student_id = ? AND date = ? ORDER BY id DESC LIMIT 1',
+                (student_id, today)
+            )
             existing = c.fetchone()
 
-            if existing:
-                face_result['status'] = 'already_marked'
-                face_result['message'] = name + ' ki attendance aaj pehle se mark hai.'
-            else:
-                c.execute('INSERT INTO attendance (student_id, date, time, status) VALUES (?, ?, ?, ?)', (student_id, today, now_time, 'Present'))
+            def seconds_since(time_str):
+                last_dt = datetime.strptime(today + ' ' + time_str, '%Y-%m-%d %H:%M:%S')
+                return (now_dt - last_dt).total_seconds()
+
+            if existing is None:
+                # No record today at all -> mark entry
+                c.execute(
+                    'INSERT INTO attendance (student_id, date, entry_time, status) VALUES (?, ?, ?, ?)',
+                    (student_id, today, now_time, 'Present')
+                )
                 conn.commit()
                 face_result['status'] = 'marked'
-                face_result['message'] = '✅ ' + name + ' - Attendance marked! Time: ' + now_time
+                face_result['action'] = 'entry'
+                face_result['message'] = '✅ ' + name + ' - Entry marked! Time: ' + now_time
+
+            else:
+                attendance_id, entry_time, exit_time = existing
+
+                if entry_time is not None and exit_time is None:
+                    # Currently "inside" -> next detection should mark exit,
+                    # but only after the cooldown so we don't flip instantly.
+                    if seconds_since(entry_time) < COOLDOWN_SECONDS:
+                        face_result['status'] = 'already_marked'
+                        face_result['action'] = 'entry'
+                        face_result['message'] = name + ' ki entry abhi mark hui hai.'
+                    else:
+                        c.execute('UPDATE attendance SET exit_time = ? WHERE id = ?', (now_time, attendance_id))
+                        conn.commit()
+                        face_result['status'] = 'marked'
+                        face_result['action'] = 'exit'
+                        face_result['message'] = '👋 ' + name + ' - Exit marked! Time: ' + now_time
+
+                else:
+                    # Both entry & exit already done -> allow fresh re-entry,
+                    # but respect cooldown after the exit too.
+                    if exit_time is not None and seconds_since(exit_time) < COOLDOWN_SECONDS:
+                        face_result['status'] = 'already_marked'
+                        face_result['action'] = 'exit'
+                        face_result['message'] = name + ' ki exit abhi mark hui hai.'
+                    else:
+                        c.execute(
+                            'INSERT INTO attendance (student_id, date, entry_time, status) VALUES (?, ?, ?, ?)',
+                            (student_id, today, now_time, 'Present')
+                        )
+                        conn.commit()
+                        face_result['status'] = 'marked'
+                        face_result['action'] = 'entry'
+                        face_result['message'] = '✅ ' + name + ' - Re-entry marked! Time: ' + now_time
 
             results.append(face_result)
 
@@ -226,7 +297,13 @@ def mark_attendance():
 def dashboard():
     conn = sqlite3.connect('database.db', timeout=10)
     c = conn.cursor()
-    query = "SELECT attendance.id, students.name, students.roll_no, students.class, attendance.date, attendance.time, attendance.status FROM attendance JOIN students ON attendance.student_id = students.id ORDER BY attendance.date DESC"
+    query = """
+        SELECT attendance.id, students.name, students.roll_no, students.class,
+               attendance.date, attendance.entry_time, attendance.exit_time, attendance.status
+        FROM attendance
+        JOIN students ON attendance.student_id = students.id
+        ORDER BY attendance.date DESC, attendance.entry_time DESC
+    """
     c.execute(query)
     records = c.fetchall()
     conn.close()

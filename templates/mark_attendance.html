@@ -1,9 +1,9 @@
 {% extends "base.html" %}
 {% block title %}Mark Attendance{% endblock %}
 {% block content %}
-<div class="card">
+<div class="card" data-endpoint="{{ url_for('mark_attendance') }}">
     <h2>Mark Attendance</h2>
-    <p>Click "Start Camera" — attendance will be marked automatically when a registered face is recognized. Multiple faces are detected at once.</p>
+    <p>Click "Start Camera" — entry will be marked automatically the first time you're seen today, and exit will be marked automatically the next time you're seen (after a short cooldown).</p>
     <div class="video-container" style="position: relative; display: inline-block;">
         <video id="video" autoplay playsinline></video>
         <canvas id="overlay" style="position:absolute; top:0; left:0; pointer-events:none;"></canvas>
@@ -15,4 +15,5 @@
     </div>
     <div id="attendanceResult"></div>
 </div>
+<script src="{{ url_for('static', filename='attendance.js') }}"></script>
 {% endblock %}

@@ -11,7 +11,8 @@
                 <th>Name</th>
                 <th>Class</th>
                 <th>Date</th>
-                <th>Time</th>
+                <th>Entry Time</th>
+                <th>Exit Time</th>
                 <th>Status</th>
                 <th>Action</th>
             </tr>
@@ -24,15 +25,16 @@
                     <td>{{ record[1] }}</td>
                     <td>{{ record[3] }}</td>
                     <td>{{ record[4] }}</td>
-                    <td>{{ record[5] }}</td>
-                    <td>{{ record[6] }}</td>
+                    <td>{{ record[5] if record[5] else '—' }}</td>
+                    <td>{{ record[6] if record[6] else '—' }}</td>
+                    <td>{{ record[7] }}</td>
                     <td>
                         <button class="btn danger delete-btn" data-id="{{ record[0] }}">🗑️ Delete</button>
                     </td>
                 </tr>
                 {% endfor %}
             {% else %}
-                <tr><td colspan="7">No data yet.</td></tr>
+                <tr><td colspan="8">No data yet.</td></tr>
             {% endif %}
         </tbody>
     </table>

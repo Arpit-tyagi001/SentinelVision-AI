@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Mark Exit{% endblock %}
+{% block content %}
+<div class="card" data-endpoint="{{ url_for('mark_exit') }}" data-mode="exit">
+    <h2>Mark Exit</h2>
+    <p>Click "Start Camera" — exit will be marked automatically when a registered face is recognized. Multiple faces are detected at once.</p>
+    <div class="video-container" style="position: relative; display: inline-block;">
+        <video id="video" autoplay playsinline></video>
+        <canvas id="overlay" style="position:absolute; top:0; left:0; pointer-events:none;"></canvas>
+        <canvas id="canvas" style="display:none;"></canvas>
+    </div>
+    <div>
+        <button id="startCam" class="btn primary">▶ Start Camera</button>
+        <button id="stopCam" class="btn danger">⏹ Stop</button>
+    </div>
+    <div id="attendanceResult"></div>
+</div>
+<script src="{{ url_for('static', filename='attendance.js') }}"></script>
+{% endblock %}
