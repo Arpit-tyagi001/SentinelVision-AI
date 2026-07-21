@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, jsonify, session, redirect, url_for
+from flask import Flask, render_template, request, jsonify, session, redirect, url_for, send_file
 from functools import wraps
 import sqlite3
 import base64
@@ -8,13 +8,15 @@ import pickle
 from datetime import datetime
 from io import BytesIO
 from PIL import Image
+from openpyxl import Workbook
+from openpyxl.styles import Font
 
 app = Flask(__name__)
 app.secret_key = 'shlok-face-attendance-secret-key-2026'  # used to sign the session cookie
 
 # ---- Admin credentials ----
-ADMIN_USERNAME = 'shlokverma'
-ADMIN_PASSWORD = 'Shlok2026'
+ADMIN_USERNAME = 'ADMIN'
+ADMIN_PASSWORD = 'ADMIN'
 
 
 def login_required(f):
@@ -126,9 +128,29 @@ def register():
     avg_encoding = np.mean(encodings, axis=0)
     encoding_blob = pickle.dumps(avg_encoding)
 
+    DUPLICATE_FACE_THRESHOLD = 0.6  # same threshold used for recognition matching
+
     try:
         conn = sqlite3.connect('database.db', timeout=10)
         c = conn.cursor()
+
+        # ---- Duplicate face check ----
+        # Reject registration if this face is already registered under a
+        # different (or the same) roll number, so one person can't be
+        # enrolled twice and double up their attendance.
+        c.execute('SELECT name, roll_no, face_encoding FROM students')
+        existing_students = c.fetchall()
+
+        for existing_name, existing_roll_no, existing_blob in existing_students:
+            existing_encoding = pickle.loads(existing_blob)
+            distance = np.linalg.norm(existing_encoding - avg_encoding)
+            if distance < DUPLICATE_FACE_THRESHOLD:
+                conn.close()
+                return jsonify({
+                    'success': False,
+                    'message': 'Yeh face pehle se register hai: ' + existing_name + ' (Roll No: ' + existing_roll_no + ')'
+                })
+
         c.execute('INSERT INTO students (name, roll_no, class, face_encoding) VALUES (?, ?, ?, ?)', (name, roll_no, student_class, encoding_blob))
         conn.commit()
         conn.close()
@@ -164,6 +186,17 @@ def match_faces(img_array, known):
     return matches
 
 
+def load_known_students(c):
+    """Fetch and unpickle all known face encodings. Shared by mark-attendance
+    and mark-exit so both pages use the identical recognition pipeline."""
+    c.execute('SELECT id, name, roll_no, class, face_encoding FROM students')
+    students = c.fetchall()
+    known = []
+    for student_id, name, roll_no, student_class, encoding_blob in students:
+        known.append((student_id, name, roll_no, student_class, pickle.loads(encoding_blob)))
+    return known
+
+
 @app.route('/mark-attendance', methods=['GET', 'POST'])
 def mark_attendance():
     """Single camera page. Automatically decides ENTRY vs EXIT per person:
@@ -172,6 +205,9 @@ def mark_attendance():
     - Both entry & exit already done -> mark a fresh re-entry (new cycle)
     A cooldown prevents the same person from toggling entry/exit every
     couple seconds just by standing in front of the camera.
+
+    NOTE: left completely unmodified. The new /mark-exit route below is a
+    separate, independent feature and does not change this route's behaviour.
     """
     if request.method == 'GET':
         return render_template('mark_attendance.html')
@@ -292,6 +328,123 @@ def mark_attendance():
         return jsonify({'faces': [], 'error': str(e)})
 
 
+@app.route('/mark-exit', methods=['GET', 'POST'])
+def mark_exit():
+    """Dedicated exit-only page/route. Does NOT touch /mark-attendance.
+
+    Behaviour per employee detected:
+    - Open record today (entry_time set, exit_time NULL) -> set exit_time.
+    - Exit already recorded today                         -> "Exit already recorded."
+    - No entry recorded today at all                      -> "Please mark entry first."
+    Never creates a new attendance row.
+    """
+    if request.method == 'GET':
+        return render_template('mark_exit.html')
+
+    data = request.get_json(silent=True) or {}
+    image_data = data.get('image')
+
+    if not image_data:
+        return jsonify({'faces': [], 'error': 'Image nahi mili'})
+
+    conn = None
+    try:
+        img_array = decode_base64_image(image_data)
+
+        conn = sqlite3.connect('database.db', timeout=10)
+        c = conn.cursor()
+        known = load_known_students(c)
+
+        matches = match_faces(img_array, known)
+
+        if len(matches) == 0:
+            conn.close()
+            return jsonify({'faces': [], 'message': 'Koi face detect nahi hua.'})
+
+        today = datetime.now().strftime('%Y-%m-%d')
+        now_time = datetime.now().strftime('%H:%M:%S')
+
+        results = []
+
+        for box, best_match in matches:
+            face_result = {'box': box}
+
+            if best_match is None:
+                face_result['name'] = 'Unknown'
+                face_result['status'] = 'unknown'
+                face_result['message'] = 'Face match nahi hua. Pehle register karo!'
+                results.append(face_result)
+                continue
+
+            student_id, name, roll_no, student_class = best_match
+            face_result['name'] = name
+            face_result['roll_no'] = roll_no
+
+            try:
+                # 1) Is there an OPEN record today (entry marked, exit not yet)?
+                c.execute(
+                    'SELECT id, entry_time, exit_time FROM attendance '
+                    'WHERE student_id = ? AND date = ? AND entry_time IS NOT NULL AND exit_time IS NULL '
+                    'ORDER BY id DESC LIMIT 1',
+                    (student_id, today)
+                )
+                open_record = c.fetchone()
+
+                if open_record:
+                    attendance_id, entry_time, _ = open_record
+                    c.execute(
+                        "UPDATE attendance SET exit_time = ?, status = 'Completed' WHERE id = ?",
+                        (now_time, attendance_id)
+                    )
+                    conn.commit()
+
+                    face_result['status'] = 'marked'
+                    face_result['entry_time'] = entry_time
+                    face_result['exit_time'] = now_time
+                    face_result['emp_status'] = 'Completed'
+                    face_result['message'] = '👋 ' + name + ' - Exit marked! Time: ' + now_time
+
+                else:
+                    # 2) No open record — either already exited today, or never entered.
+                    c.execute(
+                        'SELECT entry_time, exit_time FROM attendance '
+                        'WHERE student_id = ? AND date = ? AND entry_time IS NOT NULL AND exit_time IS NOT NULL '
+                        'ORDER BY id DESC LIMIT 1',
+                        (student_id, today)
+                    )
+                    completed = c.fetchone()
+
+                    if completed:
+                        entry_time, exit_time = completed
+                        face_result['status'] = 'already_exited'
+                        face_result['entry_time'] = entry_time
+                        face_result['exit_time'] = exit_time
+                        face_result['emp_status'] = 'Completed'
+                        face_result['message'] = 'Exit already recorded.'
+                    else:
+                        face_result['status'] = 'no_entry'
+                        face_result['entry_time'] = None
+                        face_result['exit_time'] = None
+                        face_result['emp_status'] = 'Not Entered'
+                        face_result['message'] = 'Please mark entry first.'
+
+            except sqlite3.Error as db_err:
+                print('DB error while processing exit for student', student_id, ':', db_err)
+                face_result['status'] = 'error'
+                face_result['message'] = 'Database error while marking exit. Try again.'
+
+            results.append(face_result)
+
+        conn.close()
+        return jsonify({'faces': results})
+
+    except Exception as e:
+        print(e)
+        if conn:
+            conn.close()
+        return jsonify({'faces': [], 'error': str(e)})
+
+
 @app.route('/dashboard')
 @login_required
 def dashboard():
@@ -306,8 +459,112 @@ def dashboard():
     """
     c.execute(query)
     records = c.fetchall()
+
+    # ---- Dashboard statistics (today only) ----
+    today = datetime.now().strftime('%Y-%m-%d')
+
+    c.execute(
+        'SELECT COUNT(DISTINCT student_id) FROM attendance WHERE date = ? AND entry_time IS NOT NULL',
+        (today,)
+    )
+    total_present = c.fetchone()[0]
+
+    c.execute(
+        'SELECT COUNT(*) FROM attendance WHERE date = ? AND entry_time IS NOT NULL',
+        (today,)
+    )
+    entry_count = c.fetchone()[0]
+
+    c.execute(
+        'SELECT COUNT(*) FROM attendance WHERE date = ? AND exit_time IS NOT NULL',
+        (today,)
+    )
+    exit_count = c.fetchone()[0]
+
+    c.execute(
+        'SELECT COUNT(*) FROM attendance WHERE date = ? AND entry_time IS NOT NULL AND exit_time IS NULL',
+        (today,)
+    )
+    still_inside = c.fetchone()[0]
+
+    c.execute(
+        'SELECT COUNT(*) FROM attendance WHERE date = ? AND entry_time IS NOT NULL AND exit_time IS NOT NULL',
+        (today,)
+    )
+    completed_day = c.fetchone()[0]
+
     conn.close()
-    return render_template('dashboard.html', records=records)
+
+    stats = {
+        'total_present': total_present,
+        'entry_count': entry_count,
+        'exit_count': exit_count,
+        'still_inside': still_inside,
+        'completed_day': completed_day,
+    }
+
+    return render_template('dashboard.html', records=records, stats=stats)
+
+
+@app.route('/export-attendance')
+@login_required
+def export_attendance():
+    """Generate an .xlsx export of the full attendance table on demand."""
+    try:
+        conn = sqlite3.connect('database.db', timeout=10)
+        c = conn.cursor()
+        query = """
+            SELECT students.roll_no, students.name, students.class,
+                   attendance.date, attendance.entry_time, attendance.exit_time, attendance.status
+            FROM attendance
+            JOIN students ON attendance.student_id = students.id
+            ORDER BY attendance.date DESC, attendance.entry_time DESC
+        """
+        c.execute(query)
+        records = c.fetchall()
+        conn.close()
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = 'Attendance'
+
+        headers = ['Roll No', 'Name', 'Class', 'Date', 'Entry Time', 'Exit Time', 'Status']
+        ws.append(headers)
+        for col_idx in range(1, len(headers) + 1):
+            ws.cell(row=1, column=col_idx).font = Font(bold=True)
+
+        for roll_no, name, student_class, date, entry_time, exit_time, status in records:
+            ws.append([
+                roll_no,
+                name,
+                student_class,
+                date,
+                entry_time if entry_time else '-',
+                exit_time if exit_time else '-',
+                status
+            ])
+
+        # Auto-fit column widths roughly based on content length
+        for column_cells in ws.columns:
+            max_length = max(len(str(cell.value)) if cell.value is not None else 0 for cell in column_cells)
+            ws.column_dimensions[column_cells[0].column_letter].width = max_length + 4
+
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+
+        filename = 'attendance_export_' + datetime.now().strftime('%Y%m%d_%H%M%S') + '.xlsx'
+
+        return send_file(
+            output,
+            as_attachment=True,
+            download_name=filename,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+
+    except Exception as e:
+        print('Export error:', e)
+        return jsonify({'success': False, 'message': 'Export failed: ' + str(e)}), 500
 
 
 @app.route('/delete-attendance/<int:attendance_id>', methods=['POST'])

@@ -4,6 +4,30 @@
 <div class="card">
     <h2>Attendance Dashboard</h2>
     <p>Summary and reports will appear here.</p>
+
+    <div class="stats-grid">
+        <div class="stat-card stat-present">
+            <h3>{{ stats.total_present }}</h3>
+            <p>Total Present</p>
+        </div>
+        <div class="stat-card stat-entry">
+            <h3>{{ stats.entry_count }}</h3>
+            <p>Entry Count</p>
+        </div>
+        <div class="stat-card stat-exit">
+            <h3>{{ stats.exit_count }}</h3>
+            <p>Exit Count</p>
+        </div>
+        <div class="stat-card stat-inside">
+            <h3>{{ stats.still_inside }}</h3>
+            <p>Still Inside</p>
+        </div>
+        <div class="stat-card stat-completed">
+            <h3>{{ stats.completed_day }}</h3>
+            <p>Completed Day</p>
+        </div>
+    </div>
+
     <table>
         <thead>
             <tr>
@@ -38,6 +62,6 @@
             {% endif %}
         </tbody>
     </table>
-    <button class="btn secondary">📊 Export to Excel</button>
+    <a href="{{ url_for('export_attendance') }}" class="btn secondary">📊 Export to Excel</a>
 </div>
 {% endblock %}
