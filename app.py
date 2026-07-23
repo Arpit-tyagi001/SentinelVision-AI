@@ -10,6 +10,9 @@ from io import BytesIO
 from PIL import Image
 from openpyxl import Workbook
 from openpyxl.styles import Font
+import cv2
+import threading
+import time
 
 app = Flask(__name__)
 app.secret_key = 'shlok-face-attendance-secret-key-2026'  # used to sign the session cookie
@@ -128,7 +131,7 @@ def register():
     avg_encoding = np.mean(encodings, axis=0)
     encoding_blob = pickle.dumps(avg_encoding)
 
-    DUPLICATE_FACE_THRESHOLD = 0.6  # same threshold used for recognition matching
+    DUPLICATE_FACE_THRESHOLD = 0.5  # kept in sync with the recognition threshold in match_faces
 
     try:
         conn = sqlite3.connect('database.db', timeout=10)
@@ -163,7 +166,16 @@ def register():
 
 def match_faces(img_array, known):
     """Run face detection + matching against known encodings. Returns list of
-    (box, student_tuple_or_None) pairs."""
+    (box, student_tuple_or_None) pairs.
+
+    Two safeguards against mixing up different people:
+    1. A tighter acceptance threshold (0.5 instead of the looser 0.6
+       default) — fewer borderline matches get accepted at all.
+    2. A margin check: if the two closest students are both close to the
+       current face (i.e. genuinely hard to tell apart), we reject the
+       match as unknown rather than guess. Better to ask someone to
+       re-scan than to mark the wrong person present.
+    """
     face_locations = face_recognition.face_locations(img_array)
     if len(face_locations) == 0:
         return []
@@ -171,15 +183,31 @@ def match_faces(img_array, known):
     face_encs = face_recognition.face_encodings(img_array, face_locations)
     matches = []
 
-    for (top, right, bottom, left), current_encoding in zip(face_locations, face_encs):
-        best_match = None
-        best_distance = 0.6  # recognition threshold
+    RECOGNITION_THRESHOLD = 0.5   # tighter than the 0.6 default -> fewer false positives
+    MIN_MARGIN = 0.07             # best match must be clearly better than the runner-up
 
+    for (top, right, bottom, left), current_encoding in zip(face_locations, face_encs):
+        distances = []
         for student_id, name, roll_no, student_class, saved_encoding in known:
             distance = np.linalg.norm(saved_encoding - current_encoding)
-            if distance < best_distance:
-                best_distance = distance
-                best_match = (student_id, name, roll_no, student_class)
+            distances.append((distance, student_id, name, roll_no, student_class))
+
+        best_match = None
+
+        if distances:
+            distances.sort(key=lambda d: d[0])
+            best_distance, best_id, best_name, best_roll_no, best_class = distances[0]
+
+            if best_distance < RECOGNITION_THRESHOLD:
+                # If a second candidate is almost as close as the best one,
+                # this face is ambiguous between two real students -> reject
+                # rather than risk marking the wrong person.
+                if len(distances) > 1:
+                    second_best_distance = distances[1][0]
+                    if (second_best_distance - best_distance) >= MIN_MARGIN:
+                        best_match = (best_id, best_name, best_roll_no, best_class)
+                else:
+                    best_match = (best_id, best_name, best_roll_no, best_class)
 
         matches.append(([top, right, bottom, left], best_match))
 
@@ -213,9 +241,8 @@ def load_known_students(c):
 
 liveness_state = {}
 
-EAR_OPEN_THRESHOLD = 0.25     # eyes counted as "open" above this
-EAR_CLOSED_THRESHOLD = 0.21   # eyes counted as "closed" below this
-LIVENESS_WINDOW_SECONDS = 8   # if no blink within this long, restart tracking
+EAR_CLOSED_THRESHOLD = 0.25    # eyes counted as "closed" (i.e. a blink happened) below this
+LIVENESS_WINDOW_SECONDS = 8    # if no blink within this long, restart tracking
 
 
 def eye_aspect_ratio(eye_points):
@@ -261,21 +288,24 @@ def compute_face_ear(img_array, face_location):
 
 
 def check_liveness(student_id, ear_value):
-    """Tracks open -> closed -> open transitions per student. Returns True
-    once a full blink has been confirmed within the tracking window."""
+    """A real, live face will show at least one clearly low EAR reading
+    (a blink) within a few seconds of being in front of the camera. A
+    printed photo or a phone screen has no real eyelid geometry, so it
+    essentially never produces a genuinely low reading.
+
+    This intentionally does NOT require a strict open->closed->open
+    sequence — webcam EAR readings are naturally noisy frame to frame
+    (landmark jitter), which made the stricter version unreliable in
+    practice. Requiring just one qualifying dip is simpler and more
+    robust, while still blocking static photo spoofing."""
     now = datetime.now()
     entry = liveness_state.get(student_id)
 
     if entry is None or (now - entry['last_seen']).total_seconds() > LIVENESS_WINDOW_SECONDS:
-        entry = {'state': 'open', 'blinked': False, 'last_seen': now}
+        entry = {'blinked': False, 'last_seen': now}
 
-    if ear_value is not None:
-        if ear_value < EAR_CLOSED_THRESHOLD:
-            entry['state'] = 'closed'
-        elif ear_value > EAR_OPEN_THRESHOLD:
-            if entry['state'] == 'closed':
-                entry['blinked'] = True
-            entry['state'] = 'open'
+    if ear_value is not None and ear_value < EAR_CLOSED_THRESHOLD:
+        entry['blinked'] = True
 
     entry['last_seen'] = now
     liveness_state[student_id] = entry
@@ -370,6 +400,7 @@ def mark_attendance():
                 ear = compute_face_ear(img_array, tuple(box))
                 if not check_liveness(student_id, ear):
                     face_result['status'] = 'liveness_pending'
+                    face_result['ear'] = ear
                     face_result['message'] = '👁 ' + name + ' - Please blink to verify you are a real person.'
                 else:
                     clear_liveness(student_id)
@@ -396,6 +427,7 @@ def mark_attendance():
                         ear = compute_face_ear(img_array, tuple(box))
                         if not check_liveness(student_id, ear):
                             face_result['status'] = 'liveness_pending'
+                            face_result['ear'] = ear
                             face_result['message'] = '👁 ' + name + ' - Please blink to verify you are a real person.'
                         else:
                             clear_liveness(student_id)
@@ -416,6 +448,7 @@ def mark_attendance():
                         ear = compute_face_ear(img_array, tuple(box))
                         if not check_liveness(student_id, ear):
                             face_result['status'] = 'liveness_pending'
+                            face_result['ear'] = ear
                             face_result['message'] = '👁 ' + name + ' - Please blink to verify you are a real person.'
                         else:
                             clear_liveness(student_id)
@@ -438,29 +471,13 @@ def mark_attendance():
         return jsonify({'faces': [], 'error': str(e)})
 
 
-@app.route('/mark-exit', methods=['GET', 'POST'])
-def mark_exit():
-    """Dedicated exit-only page/route. Does NOT touch /mark-attendance.
-
-    Behaviour per employee detected:
-    - Open record today (entry_time set, exit_time NULL) -> set exit_time.
-    - Exit already recorded today                         -> "Exit already recorded."
-    - No entry recorded today at all                      -> "Please mark entry first."
-    Never creates a new attendance row.
-    """
-    if request.method == 'GET':
-        return render_template('mark_exit.html')
-
-    data = request.get_json(silent=True) or {}
-    image_data = data.get('image')
-
-    if not image_data:
-        return jsonify({'faces': [], 'error': 'Image nahi mili'})
-
+def process_exit_image(img_array):
+    """Runs the full exit-marking pipeline (recognition + liveness + DB
+    write) on a single image array. Shared by the browser-based /mark-exit
+    POST route and the RTSP background camera worker, so both use
+    identical logic."""
     conn = None
     try:
-        img_array = decode_base64_image(image_data)
-
         conn = sqlite3.connect('database.db', timeout=10)
         c = conn.cursor()
         known = load_known_students(c)
@@ -469,7 +486,7 @@ def mark_exit():
 
         if len(matches) == 0:
             conn.close()
-            return jsonify({'faces': [], 'message': 'Koi face detect nahi hua.'})
+            return {'faces': [], 'message': 'Koi face detect nahi hua.'}
 
         today = datetime.now().strftime('%Y-%m-%d')
         now_time = datetime.now().strftime('%H:%M:%S')
@@ -506,6 +523,7 @@ def mark_exit():
                     if not check_liveness(student_id, ear):
                         face_result['status'] = 'liveness_pending'
                         face_result['entry_time'] = entry_time
+                        face_result['ear'] = ear
                         face_result['message'] = '👁 ' + name + ' - Please blink to verify you are a real person.'
                     else:
                         clear_liveness(student_id)
@@ -553,13 +571,144 @@ def mark_exit():
             results.append(face_result)
 
         conn.close()
-        return jsonify({'faces': results})
+        return {'faces': results}
 
     except Exception as e:
         print(e)
         if conn:
             conn.close()
-        return jsonify({'faces': [], 'error': str(e)})
+        return {'faces': [], 'error': str(e)}
+
+
+@app.route('/mark-exit', methods=['GET', 'POST'])
+def mark_exit():
+    """Dedicated exit-only page/route. Does NOT touch /mark-attendance.
+
+    This still works for browser-webcam testing (kept for backward
+    compatibility), calling the same process_exit_image() function that
+    the RTSP background camera worker uses below.
+    """
+    if request.method == 'GET':
+        return render_template('mark_exit.html')
+
+    data = request.get_json(silent=True) or {}
+    image_data = data.get('image')
+
+    if not image_data:
+        return jsonify({'faces': [], 'error': 'Image nahi mili'})
+
+    img_array = decode_base64_image(image_data)
+    return jsonify(process_exit_image(img_array))
+
+
+# ---------------------------------------------------------------------------
+# RTSP mobile-camera integration for the Exit station.
+#
+# Instead of the browser capturing frames from a webcam, a phone running an
+# app like "IP Webcam" streams RTSP video directly to this server. A
+# background thread continuously reads frames from that stream and runs
+# them through the exact same process_exit_image() pipeline used above.
+# The exit page just polls /exit-camera/status to show the latest result —
+# it doesn't touch the camera itself at all.
+# ---------------------------------------------------------------------------
+
+exit_camera_lock = threading.Lock()
+exit_camera_state = {
+    'running': False,
+    'thread': None,
+    'stop_event': None,
+    'latest': {'faces': [], 'message': 'Exit camera not started yet.'}
+}
+
+
+def exit_camera_worker(rtsp_url, stop_event):
+    cap = cv2.VideoCapture(rtsp_url)
+
+    if not cap.isOpened():
+        with exit_camera_lock:
+            exit_camera_state['latest'] = {
+                'faces': [],
+                'error': 'Could not connect to the RTSP stream. Check the URL and make sure the phone app is running and on the same network.'
+            }
+        return
+
+    NORMAL_INTERVAL = 1.0   # seconds between recognition runs when idle
+    FAST_INTERVAL = 0.25    # seconds between runs while waiting on a blink
+    current_interval = NORMAL_INTERVAL
+    last_processed = 0.0
+
+    try:
+        while not stop_event.is_set():
+            success, frame_bgr = cap.read()
+            if not success:
+                time.sleep(0.2)
+                continue
+
+            now = time.time()
+            if now - last_processed < current_interval:
+                continue  # keep draining the stream, but skip heavy processing this frame
+
+            last_processed = now
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+            try:
+                result = process_exit_image(frame_rgb)
+            except Exception as e:
+                result = {'faces': [], 'error': str(e)}
+
+            any_pending = any(f.get('status') == 'liveness_pending' for f in result.get('faces', []))
+            current_interval = FAST_INTERVAL if any_pending else NORMAL_INTERVAL
+
+            with exit_camera_lock:
+                exit_camera_state['latest'] = result
+    finally:
+        cap.release()
+
+
+@app.route('/exit-camera/start', methods=['POST'])
+@login_required
+def start_exit_camera():
+    data = request.get_json(silent=True) or {}
+    rtsp_url = (data.get('rtsp_url') or '').strip()
+
+    if not rtsp_url:
+        return jsonify({'success': False, 'message': 'RTSP URL is required.'})
+
+    with exit_camera_lock:
+        if exit_camera_state['running']:
+            return jsonify({'success': False, 'message': 'Exit camera is already running.'})
+
+        stop_event = threading.Event()
+        thread = threading.Thread(target=exit_camera_worker, args=(rtsp_url, stop_event), daemon=True)
+        exit_camera_state['stop_event'] = stop_event
+        exit_camera_state['thread'] = thread
+        exit_camera_state['running'] = True
+        exit_camera_state['latest'] = {'faces': [], 'message': 'Connecting to camera...'}
+        thread.start()
+
+    return jsonify({'success': True, 'message': 'Exit camera starting...'})
+
+
+@app.route('/exit-camera/stop', methods=['POST'])
+@login_required
+def stop_exit_camera():
+    with exit_camera_lock:
+        if not exit_camera_state['running']:
+            return jsonify({'success': False, 'message': 'Exit camera is not running.'})
+
+        exit_camera_state['stop_event'].set()
+        exit_camera_state['running'] = False
+        exit_camera_state['latest'] = {'faces': [], 'message': 'Camera stopped.'}
+
+    return jsonify({'success': True, 'message': 'Exit camera stopped.'})
+
+
+@app.route('/exit-camera/status')
+def exit_camera_status():
+    """Lightweight polling endpoint — no image upload, just returns
+    whatever the background worker last computed."""
+    with exit_camera_lock:
+        return jsonify(exit_camera_state['latest'])
 
 
 @app.route('/dashboard')
@@ -698,6 +847,41 @@ def delete_attendance(attendance_id):
         return jsonify({'success': False, 'message': str(e)})
 
 
+@app.route('/delete-all-attendance', methods=['POST'])
+@login_required
+def delete_all_attendance():
+    """Clears every row from the attendance table. Does NOT touch the
+    students table — registered faces are unaffected."""
+    try:
+        conn = sqlite3.connect('database.db', timeout=10)
+        c = conn.cursor()
+        c.execute('DELETE FROM attendance')
+        conn.commit()
+        conn.close()
+        return jsonify({'success': True, 'message': 'All attendance records deleted successfully'})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)})
+
+
+@app.route('/delete-all-students', methods=['POST'])
+@login_required
+def delete_all_students():
+    """Clears every registered face from the students table. Also clears
+    attendance, since attendance rows pointing at a deleted student would
+    otherwise silently disappear from the dashboard's JOIN query anyway —
+    better to remove them explicitly than leave invisible orphan rows."""
+    try:
+        conn = sqlite3.connect('database.db', timeout=10)
+        c = conn.cursor()
+        c.execute('DELETE FROM attendance')
+        c.execute('DELETE FROM students')
+        conn.commit()
+        conn.close()
+        return jsonify({'success': True, 'message': 'All registered faces deleted successfully'})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)})
+
+
 if __name__ == '__main__':
     print("Flask server ab start ho raha hai...")
-    app.run(debug=True)
+    app.run(debug=True, threaded=True)
