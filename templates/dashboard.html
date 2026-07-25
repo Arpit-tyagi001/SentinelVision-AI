@@ -63,5 +63,61 @@
         </tbody>
     </table>
     <a href="{{ url_for('export_attendance') }}" class="btn secondary">📊 Export to Excel</a>
+    <button id="deleteAllBtn" class="btn danger">🗑️ Delete All Attendance</button>
+    <button id="deleteAllStudentsBtn" class="btn danger">🗑️ Delete All Registered Faces</button>
 </div>
+
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+    const deleteAllBtn = document.getElementById('deleteAllBtn');
+    if (deleteAllBtn) {
+        deleteAllBtn.addEventListener('click', function () {
+            const confirmed = confirm(
+                'This will permanently delete ALL attendance records (entries and exits for everyone). ' +
+                'Registered faces will NOT be affected. This cannot be undone. Continue?'
+            );
+            if (!confirmed) return;
+
+            fetch("{{ url_for('delete_all_attendance') }}", { method: 'POST' })
+                .then(res => res.json())
+                .then(data => {
+                    if (data.success) {
+                        window.location.reload();
+                    } else {
+                        alert('Failed to delete records: ' + (data.message || 'Unknown error'));
+                    }
+                })
+                .catch(err => {
+                    console.error('Delete-all error:', err);
+                    alert('Something went wrong while deleting records.');
+                });
+        });
+    }
+
+    const deleteAllStudentsBtn = document.getElementById('deleteAllStudentsBtn');
+    if (deleteAllStudentsBtn) {
+        deleteAllStudentsBtn.addEventListener('click', function () {
+            const confirmed = confirm(
+                'This will permanently delete ALL registered faces AND all attendance records. ' +
+                'Everyone will need to register again from scratch. This cannot be undone. Continue?'
+            );
+            if (!confirmed) return;
+
+            fetch("{{ url_for('delete_all_students') }}", { method: 'POST' })
+                .then(res => res.json())
+                .then(data => {
+                    if (data.success) {
+                        window.location.reload();
+                    } else {
+                        alert('Failed to delete registered faces: ' + (data.message || 'Unknown error'));
+                    }
+                })
+                .catch(err => {
+                    console.error('Delete-all-students error:', err);
+                    alert('Something went wrong while deleting registered faces.');
+                });
+        });
+    }
+});
+</script>
 {% endblock %}

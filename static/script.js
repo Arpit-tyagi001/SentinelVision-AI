@@ -37,30 +37,39 @@ function playClickSound() {
 document.addEventListener('DOMContentLoaded', function () {
     console.log('Attendance System loaded.');
 
+    // NOTE: The automatic multi-face recognition loop that used to live
+    // here (startAutoRecognition / captureAndRecognize / renderFaces) has
+    // been removed. attendance.js and exit.js now own that responsibility
+    // entirely for their respective pages, including liveness/blink
+    // detection. Having two independent capture loops hitting
+    // /mark-attendance at the same time caused them to race each other
+    // and broke the blink-detection timing. This file now only handles:
+    // register-page image capture, the register form submit, and the
+    // dashboard delete buttons.
+
     let stream = null;
     let capturedImages = [];
 
     const video = document.getElementById('video');
     const canvas = document.getElementById('canvas');       // hidden capture canvas
-    const overlay = document.getElementById('overlay');     // visible box-drawing canvas
+    const overlay = document.getElementById('overlay');      // visible box-drawing canvas (used by attendance.js/exit.js, not here)
 
     // ---------- START CAMERA ----------
+    // Kept generic (used by the register page, which has no auto-recognition
+    // of its own). On mark_attendance.html / mark_exit.html, attendance.js /
+    // exit.js handle camera start/stop themselves, so this handler simply
+    // does nothing extra there beyond the click sound + local preview.
     const startCam = document.getElementById('startCam');
-    if (startCam && video) {
+    if (startCam && video && !overlay) {
+        // Only wire this up when there's no overlay canvas on the page —
+        // i.e. NOT on the mark-attendance/mark-exit pages, which manage
+        // their own camera lifecycle in attendance.js / exit.js.
         startCam.addEventListener('click', async function () {
             playClickSound();
             try {
                 stream = await navigator.mediaDevices.getUserMedia({ video: true });
                 video.srcObject = stream;
                 console.log('Camera started successfully.');
-
-                // If we're on the mark-attendance page, kick off auto recognition
-                if (overlay) {
-                    video.addEventListener('loadedmetadata', function onMeta() {
-                        video.removeEventListener('loadedmetadata', onMeta);
-                        startAutoRecognition();
-                    });
-                }
             } catch (err) {
                 console.error('Camera error:', err);
                 alert('Camera access nahi mil paayi: ' + err.message);
@@ -70,7 +79,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
     // ---------- STOP CAMERA ----------
     const stopCam = document.getElementById('stopCam');
-    if (stopCam && video) {
+    if (stopCam && video && !overlay) {
         stopCam.addEventListener('click', function () {
             playClickSound();
             if (stream) {
@@ -78,11 +87,6 @@ document.addEventListener('DOMContentLoaded', function () {
                 video.srcObject = null;
                 stream = null;
                 console.log('Camera stopped.');
-            }
-            stopAutoRecognition();
-            if (overlay) {
-                const octx = overlay.getContext('2d');
-                octx.clearRect(0, 0, overlay.width, overlay.height);
             }
         });
     }
@@ -168,93 +172,6 @@ document.addEventListener('DOMContentLoaded', function () {
                 alert('Server error: ' + err.message);
             }
         });
-    }
-
-    // ---------- MARK ATTENDANCE PAGE: AUTOMATIC MULTI-FACE RECOGNITION ----------
-    let recognitionTimer = null;
-    let isBusy = false;                 // prevents overlapping requests
-    const alreadyBeeped = new Set();    // avoid repeat beep spam for same person this session
-
-    function startAutoRecognition() {
-        if (!video || !canvas || !overlay) return;
-        if (recognitionTimer) return; // already running
-
-        overlay.width = video.videoWidth;
-        overlay.height = video.videoHeight;
-
-        recognitionTimer = setInterval(captureAndRecognize, 1500); // every 1.5s
-    }
-
-    function stopAutoRecognition() {
-        if (recognitionTimer) {
-            clearInterval(recognitionTimer);
-            recognitionTimer = null;
-        }
-    }
-
-    async function captureAndRecognize() {
-        if (!stream || isBusy) return;
-        isBusy = true;
-
-        try {
-            const ctx = canvas.getContext('2d');
-            canvas.width = video.videoWidth;
-            canvas.height = video.videoHeight;
-            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-            const imageData = canvas.toDataURL('image/jpeg');
-
-            const response = await fetch('/mark-attendance', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ image: imageData })
-            });
-
-            const result = await response.json();
-            renderFaces(result.faces || [], result.message);
-        } catch (err) {
-            console.error('Recognition error:', err);
-        } finally {
-            isBusy = false;
-        }
-    }
-
-    function renderFaces(faces, noFaceMessage) {
-        const resultDiv = document.getElementById('attendanceResult');
-        const octx = overlay.getContext('2d');
-        octx.clearRect(0, 0, overlay.width, overlay.height);
-
-        if (!faces || faces.length === 0) {
-            if (resultDiv) resultDiv.textContent = noFaceMessage || 'Koi face detect nahi hua.';
-            return;
-        }
-
-        const lines = [];
-
-        faces.forEach(function (face) {
-            const [top, right, bottom, left] = face.box;
-            const boxColor = face.status === 'marked' ? '#22c55e'
-                            : face.status === 'already_marked' ? '#3b82f6'
-                            : '#ef4444';
-
-            octx.strokeStyle = boxColor;
-            octx.lineWidth = 3;
-            octx.strokeRect(left, top, right - left, bottom - top);
-
-            octx.fillStyle = boxColor;
-            octx.font = '18px sans-serif';
-            const label = face.name || 'Unknown';
-            const textY = top > 20 ? top - 8 : bottom + 20;
-            octx.fillText(label, left, textY);
-
-            lines.push(face.message);
-
-            if (face.status === 'marked' && !alreadyBeeped.has(face.name)) {
-                alreadyBeeped.add(face.name);
-                playBeep();
-            }
-        });
-
-        if (resultDiv) resultDiv.innerHTML = lines.join('<br>');
     }
 
     // ---------- DASHBOARD: DELETE ATTENDANCE ----------
