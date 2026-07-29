@@ -15,6 +15,8 @@ document.addEventListener('DOMContentLoaded', function () {
     const startBtn = document.getElementById('startCam');
     const stopBtn = document.getElementById('stopCam');
     const resultDiv = document.getElementById('attendanceResult');
+    const laserScan = document.getElementById('laserScan');
+    const hudStatusPill = document.getElementById('hudStatusPill');
 
     const ctx = overlay.getContext('2d');
     const captureCtx = canvas.getContext('2d');
@@ -22,31 +24,49 @@ document.addEventListener('DOMContentLoaded', function () {
     let stream = null;
     let captureInterval = null;
     const NORMAL_INTERVAL_MS = 2000;  // normal polling rate
-    const FAST_INTERVAL_MS = 250;     // fast rate while waiting for a blink,
-                                       // fast enough to actually catch the
-                                       // ~150-400ms window eyes are closed
+    const FAST_INTERVAL_MS = 250;     // fast rate while waiting for a blink
     let currentIntervalMs = NORMAL_INTERVAL_MS;
 
-    // Track recently shown messages per roll_no so we don't spam the UI
-    // every single interval with the same message.
     const lastMessageByRoll = {};
+
+    function syncCanvasSize() {
+        if (!video || !video.videoWidth || !video.videoHeight) return;
+
+        // Sync internal pixel dimensions of overlay and hidden capture canvas
+        overlay.width = video.videoWidth;
+        overlay.height = video.videoHeight;
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+    }
+
+    video.addEventListener('loadedmetadata', syncCanvasSize);
+    video.addEventListener('resize', syncCanvasSize);
+    window.addEventListener('resize', syncCanvasSize);
+
+    function updateHudPill(text, icon = '🔍', stateClass = 'scanning') {
+        if (!hudStatusPill) return;
+        hudStatusPill.className = `hud-status-pill ${stateClass}`;
+        hudStatusPill.innerHTML = `<span class="pill-icon">${icon}</span> <span class="pill-text">${text}</span>`;
+    }
 
     async function startCamera() {
         try {
             stream = await navigator.mediaDevices.getUserMedia({ video: true });
             video.srcObject = stream;
+            video.onloadedmetadata = syncCanvasSize;
 
-            video.onloadedmetadata = () => {
-                overlay.width = video.videoWidth;
-                overlay.height = video.videoHeight;
-                canvas.width = video.videoWidth;
-                canvas.height = video.videoHeight;
-            };
+            if (laserScan) laserScan.classList.remove('paused');
+            updateHudPill('Scanning for face...', '🔍', 'scanning');
 
             currentIntervalMs = NORMAL_INTERVAL_MS;
             captureInterval = setInterval(captureAndSend, currentIntervalMs);
         } catch (err) {
             console.error('Camera error:', err);
+            if (typeof showToast === 'function') {
+                showToast('Camera access denied or unavailable: ' + err.message, 'error');
+            }
+            if (laserScan) laserScan.classList.add('paused');
+            updateHudPill('Camera Access Denied', '❌', 'error');
             resultDiv.innerHTML = '<p class="error">❌ Camera access denied or unavailable.</p>';
         }
     }
@@ -71,10 +91,15 @@ document.addEventListener('DOMContentLoaded', function () {
         }
         video.srcObject = null;
         ctx.clearRect(0, 0, overlay.width, overlay.height);
+
+        if (laserScan) laserScan.classList.add('paused');
+        updateHudPill('Camera Off', '⏹', 'scanning');
     }
 
     function captureAndSend() {
         if (!video.videoWidth || !video.videoHeight) return;
+
+        syncCanvasSize();
 
         captureCtx.drawImage(video, 0, 0, canvas.width, canvas.height);
         const imageData = canvas.toDataURL('image/jpeg', 0.8);
@@ -92,21 +117,54 @@ document.addEventListener('DOMContentLoaded', function () {
     function handleResponse(data) {
         ctx.clearRect(0, 0, overlay.width, overlay.height);
 
+        // Check for fire/smoke detection alert from backend
+        if (data.fire_alert) {
+            if (typeof triggerFireAlertUI === 'function') {
+                triggerFireAlertUI();
+            }
+        }
+
+        if (data.fire_boxes && data.fire_boxes.length > 0) {
+            data.fire_boxes.forEach(fbox => drawFireBox(fbox));
+        }
+
         if (data.error) {
+            if (laserScan) laserScan.classList.remove('paused');
+            updateHudPill('Error: ' + data.error, '❌', 'error');
             resultDiv.innerHTML = '<p class="error">❌ ' + data.error + '</p>';
             return;
         }
 
         if (!data.faces || data.faces.length === 0) {
             setCaptureRate(NORMAL_INTERVAL_MS);
+            if (laserScan) laserScan.classList.remove('paused'); // resume laser scanning when searching
+            updateHudPill('Scanning for face...', '🔍', 'scanning');
+
             if (data.message) {
                 resultDiv.innerHTML = '<p>' + data.message + '</p>';
             }
             return;
         }
 
+        // Face is actively detected -> Pause laser scanning to avoid distracting verification
+        if (laserScan) laserScan.classList.add('paused');
+
         const anyPending = data.faces.some(f => f.status === 'liveness_pending');
         setCaptureRate(anyPending ? FAST_INTERVAL_MS : NORMAL_INTERVAL_MS);
+
+        // Update HUD pill badge based on primary face status
+        const primaryFace = data.faces[0];
+        if (primaryFace.status === 'liveness_pending') {
+            updateHudPill('Verifying Liveness (Please Blink)', '👁️', 'liveness');
+        } else if (primaryFace.status === 'marked' && primaryFace.action === 'entry') {
+            updateHudPill(`Entry Marked: ${primaryFace.name}`, '✅', 'success');
+        } else if (primaryFace.status === 'marked' && primaryFace.action === 'exit') {
+            updateHudPill(`Exit Marked: ${primaryFace.name}`, '🚪', 'success');
+        } else if (primaryFace.status === 'already_marked') {
+            updateHudPill(`Already Marked Today: ${primaryFace.name}`, '⏳', 'warning');
+        } else if (primaryFace.status === 'unknown') {
+            updateHudPill('Unknown Face Detected', '⚠️', 'error');
+        }
 
         let messagesHtml = '';
 
@@ -119,7 +177,6 @@ document.addEventListener('DOMContentLoaded', function () {
 
             const key = face.roll_no || face.name || 'unknown';
 
-            // Avoid re-printing the exact same message repeatedly
             if (lastMessageByRoll[key] === face.message) return;
             lastMessageByRoll[key] = face.message;
 
@@ -152,7 +209,7 @@ document.addEventListener('DOMContentLoaded', function () {
         ctx.strokeRect(left, top, right - left, bottom - top);
 
         const label = face.name || 'Unknown';
-        ctx.font = '16px Arial';
+        ctx.font = '16px Outfit, sans-serif';
         const textWidth = ctx.measureText(label).width;
 
         ctx.fillStyle = color;
@@ -162,9 +219,26 @@ document.addEventListener('DOMContentLoaded', function () {
         ctx.fillText(label, left + 5, bottom + 16);
     }
 
+    function drawFireBox(fbox) {
+        if (!fbox.box) return;
+        const [x1, y1, x2, y2] = fbox.box;
+        ctx.strokeStyle = '#ef4444';
+        ctx.lineWidth = 4;
+        ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+
+        const label = `🔥 ${fbox.label || 'FIRE'} (${fbox.confidence || ''})`;
+        ctx.font = 'bold 15px Outfit, sans-serif';
+        const textWidth = ctx.measureText(label).width;
+
+        ctx.fillStyle = '#ef4444';
+        ctx.fillRect(x1, Math.max(y1 - 24, 0), textWidth + 10, 24);
+
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText(label, x1 + 5, Math.max(y1 - 7, 17));
+    }
+
     startBtn.addEventListener('click', startCamera);
     stopBtn.addEventListener('click', stopCamera);
 
-    // Stop the camera cleanly if the user navigates away
     window.addEventListener('beforeunload', stopCamera);
 });

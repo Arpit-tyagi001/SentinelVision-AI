@@ -100,8 +100,8 @@ http://127.0.0.1:5000
 
 ## 👥 Contributors
 
-- Arpit Tyagi
-- Shlok Verma
+- [Arpit Tyagi](https://github.com/Arpit-tyagi001)
+- [Shlok Verma](https://github.com/shlokverma0)
 
 
 ---
@@ -109,4 +109,3 @@ http://127.0.0.1:5000
 ## 📄 License
 
 This project is open source and available for educational purposes.
-Steps:

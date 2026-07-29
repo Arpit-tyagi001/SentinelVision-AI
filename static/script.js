@@ -1,3 +1,176 @@
+// ---------- GLOBAL UI UTILITIES (TOAST & MODAL) ----------
+function showToast(message, type = 'info') {
+    let container = document.getElementById('toastContainer');
+    if (!container) {
+        container = document.createElement('div');
+        container.id = 'toastContainer';
+        document.body.appendChild(container);
+    }
+    const toast = document.createElement('div');
+    toast.className = `toast toast-${type}`;
+
+    let icon = 'ℹ️';
+    if (type === 'success') icon = '✅';
+    if (type === 'error') icon = '❌';
+    if (type === 'warning') icon = '⚠️';
+
+    toast.innerHTML = `<span class="toast-icon">${icon}</span><span class="toast-message">${message}</span><span class="toast-close">&times;</span>`;
+
+    container.appendChild(toast);
+
+    setTimeout(() => toast.classList.add('show'), 10);
+
+    const removeToast = () => {
+        toast.classList.remove('show');
+        setTimeout(() => toast.remove(), 300);
+    };
+
+    toast.querySelector('.toast-close').addEventListener('click', removeToast);
+    setTimeout(removeToast, 4000);
+}
+
+function showConfirmModal(options) {
+    return new Promise((resolve) => {
+        let title = 'Confirm Action';
+        let message = '';
+        let confirmText = 'Confirm';
+        let danger = true;
+
+        if (typeof options === 'string') {
+            message = options;
+        } else if (typeof options === 'object') {
+            title = options.title || title;
+            message = options.message || message;
+            confirmText = options.confirmText || confirmText;
+            if (options.danger !== undefined) danger = options.danger;
+        }
+
+        const backdrop = document.createElement('div');
+        backdrop.className = 'modal-backdrop';
+
+        backdrop.innerHTML = `
+            <div class="modal-card">
+                <h3>${title}</h3>
+                <p>${message}</p>
+                <div class="modal-actions">
+                    <button class="btn secondary modal-cancel">Cancel</button>
+                    <button class="btn ${danger ? 'danger' : 'primary'} modal-confirm">${confirmText}</button>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(backdrop);
+        setTimeout(() => backdrop.classList.add('show'), 10);
+
+        const close = (result) => {
+            backdrop.classList.remove('show');
+            setTimeout(() => backdrop.remove(), 300);
+            resolve(result);
+        };
+
+        backdrop.querySelector('.modal-cancel').addEventListener('click', () => close(false));
+        backdrop.querySelector('.modal-confirm').addEventListener('click', () => close(true));
+        backdrop.addEventListener('click', (e) => {
+            if (e.target === backdrop) close(false);
+        });
+    });
+}
+
+// ---------- FIRE ALARM AUDIBLE SIREN & RE-ARM STATE TRACKING ----------
+let fireAudioCtx = null;
+let fireSirenInterval = null;
+let fireAlarmActive = false;
+let fireDismissedAt = 0;
+const REARM_WINDOW_MS = 30000; // Requirement 2: 30-second re-arm window
+
+function playFireAlarmLoop() {
+    if (fireAlarmActive) return;
+    fireAlarmActive = true;
+
+    try {
+        if (!fireAudioCtx) {
+            fireAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        if (fireAudioCtx.state === 'suspended') {
+            fireAudioCtx.resume();
+        }
+
+        let toggle = false;
+        fireSirenInterval = setInterval(() => {
+            if (!fireAlarmActive) return;
+            try {
+                const osc = fireAudioCtx.createOscillator();
+                const gain = fireAudioCtx.createGain();
+                osc.connect(gain);
+                gain.connect(fireAudioCtx.destination);
+
+                osc.type = 'sawtooth';
+                osc.frequency.value = toggle ? 1200 : 750;
+                gain.gain.value = 0.35; // distinct multi-tone loud siren
+
+                osc.start();
+                osc.stop(fireAudioCtx.currentTime + 0.22);
+                toggle = !toggle;
+            } catch (e) {
+                console.error("Audio tone error:", e);
+            }
+        }, 250);
+    } catch (e) {
+        console.error("Fire alarm audio context error:", e);
+    }
+}
+
+function stopFireAlarmLoop() {
+    fireAlarmActive = false;
+    if (fireSirenInterval) {
+        clearInterval(fireSirenInterval);
+        fireSirenInterval = null;
+    }
+}
+
+let latestFireDetectedState = false;
+let fireRearmTimeout = null;
+
+function triggerFireAlertUI(forceRearm = false) {
+    latestFireDetectedState = true;
+    const now = Date.now();
+    const banner = document.getElementById('fireAlertBanner');
+
+    // Check 30-second re-arm window requirement:
+    if (!forceRearm && (now - fireDismissedAt < REARM_WINDOW_MS)) {
+        // Suppress audio & banner during 30s re-arm window
+        return;
+    }
+
+    if (banner) {
+        banner.style.display = 'block';
+    }
+    // playFireAlarmLoop has a strict (fireAlarmActive) guard to prevent stacking oscillators
+    playFireAlarmLoop();
+}
+
+function dismissFireAlertUI() {
+    fireDismissedAt = Date.now();
+    const banner = document.getElementById('fireAlertBanner');
+    if (banner) {
+        banner.style.display = 'none';
+    }
+    stopFireAlarmLoop();
+
+    if (typeof showToast === 'function') {
+        showToast('Fire alarm dismissed. Siren silenced for 30s re-arm window.', 'info');
+    }
+
+    // Explicit automatic re-arm timer: after 30 seconds, if fire is still detected, reactivate alarm!
+    if (fireRearmTimeout) clearTimeout(fireRearmTimeout);
+    fireRearmTimeout = setTimeout(() => {
+        if (latestFireDetectedState) {
+            console.log('[Fire Alarm] 30s re-arm window expired while fire remains present -> REACTIVATING ALARM!');
+            triggerFireAlertUI(true);
+        }
+    }, REARM_WINDOW_MS);
+}
+
 function playBeep() {
     const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     const oscillator = audioCtx.createOscillator();
@@ -35,44 +208,33 @@ function playClickSound() {
 }
 
 document.addEventListener('DOMContentLoaded', function () {
-    console.log('Attendance System loaded.');
+    const dismissBtn = document.getElementById('dismissFireAlert');
+    if (dismissBtn) {
+        dismissBtn.addEventListener('click', dismissFireAlertUI);
+    }
 
-    // NOTE: The automatic multi-face recognition loop that used to live
-    // here (startAutoRecognition / captureAndRecognize / renderFaces) has
-    // been removed. attendance.js and exit.js now own that responsibility
-    // entirely for their respective pages, including liveness/blink
-    // detection. Having two independent capture loops hitting
-    // /mark-attendance at the same time caused them to race each other
-    // and broke the blink-detection timing. This file now only handles:
-    // register-page image capture, the register form submit, and the
-    // dashboard delete buttons.
+    console.log('Attendance System loaded.');
 
     let stream = null;
     let capturedImages = [];
 
     const video = document.getElementById('video');
     const canvas = document.getElementById('canvas');       // hidden capture canvas
-    const overlay = document.getElementById('overlay');      // visible box-drawing canvas (used by attendance.js/exit.js, not here)
+    const overlay = document.getElementById('overlay');      // visible box-drawing canvas
 
     // ---------- START CAMERA ----------
-    // Kept generic (used by the register page, which has no auto-recognition
-    // of its own). On mark_attendance.html / mark_exit.html, attendance.js /
-    // exit.js handle camera start/stop themselves, so this handler simply
-    // does nothing extra there beyond the click sound + local preview.
     const startCam = document.getElementById('startCam');
     if (startCam && video && !overlay) {
-        // Only wire this up when there's no overlay canvas on the page —
-        // i.e. NOT on the mark-attendance/mark-exit pages, which manage
-        // their own camera lifecycle in attendance.js / exit.js.
         startCam.addEventListener('click', async function () {
             playClickSound();
             try {
                 stream = await navigator.mediaDevices.getUserMedia({ video: true });
                 video.srcObject = stream;
                 console.log('Camera started successfully.');
+                showToast('Camera started successfully.', 'info');
             } catch (err) {
                 console.error('Camera error:', err);
-                alert('Camera access nahi mil paayi: ' + err.message);
+                showToast('Camera access nahi mil paayi: ' + err.message, 'error');
             }
         });
     }
@@ -87,21 +249,27 @@ document.addEventListener('DOMContentLoaded', function () {
                 video.srcObject = null;
                 stream = null;
                 console.log('Camera stopped.');
+                showToast('Camera stopped.', 'info');
             }
         });
     }
 
-    // ---------- REGISTER PAGE: CAPTURE 5 IMAGES ----------
+    // ---------- REGISTER PAGE: CAPTURE 5 IMAGES WITH GALLERY & PROGRESS ----------
     const captureBtn = document.getElementById('captureBtn');
+    const thumbGallery = document.getElementById('thumbGallery');
+    const stepBadge = document.getElementById('stepBadge');
+    const progressFill = document.getElementById('progressFill');
+
     if (captureBtn && video && canvas) {
         captureBtn.addEventListener('click', async function () {
             playClickSound();
             if (!stream) {
-                alert('Pehle camera start karo!');
+                showToast('Pehle camera start karo!', 'warning');
                 return;
             }
 
             capturedImages = [];
+            if (thumbGallery) thumbGallery.innerHTML = '';
             const statusDiv = document.getElementById('captureStatus');
             const ctx = canvas.getContext('2d');
             canvas.width = video.videoWidth;
@@ -111,12 +279,24 @@ document.addEventListener('DOMContentLoaded', function () {
                 ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
                 const dataUrl = canvas.toDataURL('image/jpeg');
                 capturedImages.push(dataUrl);
-                statusDiv.textContent = `📸 Capturing... ${i + 1}/5`;
+
+                const currentStep = i + 1;
+                if (stepBadge) stepBadge.textContent = `Step ${currentStep} of 5`;
+                if (progressFill) progressFill.style.width = `${(currentStep / 5) * 100}%`;
+
+                if (thumbGallery) {
+                    const thumb = document.createElement('div');
+                    thumb.className = 'thumb-card';
+                    thumb.innerHTML = `<img src="${dataUrl}" alt="Face ${currentStep}"><span class="thumb-badge">✓ #${currentStep}</span>`;
+                    thumbGallery.appendChild(thumb);
+                }
+
+                if (statusDiv) statusDiv.textContent = `📸 Capturing... Step ${currentStep} of 5`;
                 await new Promise(resolve => setTimeout(resolve, 500));
             }
 
-            statusDiv.textContent = '✅ 5 images captured! Ab "Register" button dabao.';
-            console.log('Captured images:', capturedImages.length);
+            if (statusDiv) statusDiv.textContent = '✅ 5 images captured successfully! Confirm info below and submit.';
+            showToast('5 face images captured successfully!', 'success');
         });
     }
 
@@ -127,7 +307,7 @@ document.addEventListener('DOMContentLoaded', function () {
             e.preventDefault();
 
             if (capturedImages.length < 5) {
-                alert('Pehle 5 images capture karo!');
+                showToast('Pehle 5 images capture karo!', 'warning');
                 return;
             }
 
@@ -136,7 +316,7 @@ document.addEventListener('DOMContentLoaded', function () {
             const studentClass = document.getElementById('class').value;
 
             const statusDiv = document.getElementById('captureStatus');
-            statusDiv.textContent = '⏳ Registering... please wait';
+            if (statusDiv) statusDiv.textContent = '⏳ Registering student... please wait';
 
             try {
                 const response = await fetch('/register', {
@@ -153,23 +333,26 @@ document.addEventListener('DOMContentLoaded', function () {
                 const result = await response.json();
 
                 if (result.success) {
-                    statusDiv.textContent = '✅ ' + result.message;
-                    alert('Student registered successfully!');
+                    if (statusDiv) statusDiv.textContent = '✅ ' + result.message;
+                    showToast('Student registered successfully!', 'success');
                     registerForm.reset();
                     capturedImages = [];
+                    if (thumbGallery) thumbGallery.innerHTML = '';
+                    if (stepBadge) stepBadge.textContent = 'Step 0 of 5';
+                    if (progressFill) progressFill.style.width = '0%';
                     if (stream) {
                         stream.getTracks().forEach(track => track.stop());
                         video.srcObject = null;
                         stream = null;
                     }
                 } else {
-                    statusDiv.textContent = '❌ ' + result.message;
-                    alert('Error: ' + result.message);
+                    if (statusDiv) statusDiv.textContent = '❌ ' + result.message;
+                    showToast('Error: ' + result.message, 'error');
                 }
             } catch (err) {
                 console.error('Registration error:', err);
-                statusDiv.textContent = '❌ Registration failed';
-                alert('Server error: ' + err.message);
+                if (statusDiv) statusDiv.textContent = '❌ Registration failed';
+                showToast('Server error: ' + err.message, 'error');
             }
         });
     }
@@ -179,9 +362,14 @@ document.addEventListener('DOMContentLoaded', function () {
     deleteButtons.forEach(function (btn) {
         btn.addEventListener('click', async function () {
             const attendanceId = btn.getAttribute('data-id');
-            const confirmDelete = confirm('Kya aap yeh record delete karna chahte ho?');
+            const confirmed = await showConfirmModal({
+                title: 'Delete Record',
+                message: 'Kya aap yeh record delete karna chahte ho?',
+                confirmText: 'Delete',
+                danger: true
+            });
 
-            if (!confirmDelete) return;
+            if (!confirmed) return;
 
             try {
                 const response = await fetch('/delete-attendance/' + attendanceId, {
@@ -192,12 +380,13 @@ document.addEventListener('DOMContentLoaded', function () {
                 if (result.success) {
                     const row = document.getElementById('row-' + attendanceId);
                     if (row) row.remove();
+                    showToast('Record deleted successfully', 'success');
                 } else {
-                    alert('Delete fail hua: ' + result.message);
+                    showToast('Delete fail hua: ' + result.message, 'error');
                 }
             } catch (err) {
                 console.error('Delete error:', err);
-                alert('Server error hua delete karte waqt.');
+                showToast('Server error hua delete karte waqt.', 'error');
             }
         });
     });

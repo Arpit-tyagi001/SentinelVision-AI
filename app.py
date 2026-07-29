@@ -3,6 +3,8 @@ from functools import wraps
 import sqlite3
 import base64
 import numpy as np
+from dotenv import load_dotenv
+load_dotenv()
 import face_recognition
 import pickle
 from datetime import datetime
@@ -13,9 +15,23 @@ from openpyxl.styles import Font
 import cv2
 import threading
 import time
+import os
 
 app = Flask(__name__)
 app.secret_key = 'shlok-face-attendance-secret-key-2026'  # used to sign the session cookie
+
+# ---- White-Label Application Configuration ----
+APP_NAME = os.environ.get('APP_NAME', '[APP_NAME]')
+APP_DESCRIPTION = os.environ.get('APP_DESCRIPTION', 'Automatic attendance marking using facial recognition.')
+
+
+@app.context_processor
+def inject_app_config():
+    return {
+        'APP_NAME': APP_NAME,
+        'APP_DESCRIPTION': APP_DESCRIPTION
+    }
+
 
 # ---- Admin credentials ----
 ADMIN_USERNAME = 'ADMIN'
@@ -51,6 +67,26 @@ def init_db():
         exit_time TIME,
         status TEXT DEFAULT 'Present'
     )''')
+    # Fire/smoke detection alerts table
+    c.execute('''CREATE TABLE IF NOT EXISTS fire_alerts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp DATETIME NOT NULL,
+        confidence REAL NOT NULL,
+        label TEXT DEFAULT 'fire',
+        camera_source TEXT NOT NULL
+    )''')
+    # Time-window intrusion / after-hours alerts table
+    c.execute('''CREATE TABLE IF NOT EXISTS after_hours_alerts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp DATETIME NOT NULL,
+        person_name TEXT NOT NULL,
+        confidence REAL DEFAULT 0.0,
+        camera_source TEXT NOT NULL
+    )''')
+    c.execute("PRAGMA table_info(after_hours_alerts)")
+    cols = [row[1] for row in c.fetchall()]
+    if 'confidence' not in cols:
+        c.execute("ALTER TABLE after_hours_alerts ADD COLUMN confidence REAL DEFAULT 0.0")
     conn.commit()
     conn.close()
     print("Database ready.")
@@ -356,6 +392,10 @@ def mark_attendance():
     try:
         img_array = decode_base64_image(image_data)
 
+        # Run fire detection on incoming frame
+        img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+        fire_boxes, fire_alert = run_fire_detection(img_bgr, conf_thresh=0.50, camera_source="Webcam")
+
         conn = sqlite3.connect('database.db', timeout=10)
         c = conn.cursor()
         c.execute('SELECT id, name, roll_no, class, face_encoding FROM students')
@@ -369,7 +409,12 @@ def mark_attendance():
 
         if len(matches) == 0:
             conn.close()
-            return jsonify({'faces': [], 'message': 'Koi face detect nahi hua.'})
+            return jsonify({
+                'faces': [],
+                'message': 'Koi face detect nahi hua.',
+                'fire_alert': fire_alert,
+                'fire_boxes': fire_boxes
+            })
 
         today = datetime.now().strftime('%Y-%m-%d')
         now_dt = datetime.now()
@@ -405,8 +450,6 @@ def mark_attendance():
                     return (now_dt - last_dt).total_seconds()
 
                 if existing is None:
-                    # No record today at all -> mark entry, but only once a
-                    # live blink has been confirmed for this student.
                     ear = compute_face_ear(img_array, tuple(box))
                     if not check_liveness(student_id, ear):
                         face_result['status'] = 'liveness_pending'
@@ -427,11 +470,6 @@ def mark_attendance():
                     attendance_id, entry_time, exit_time = existing
 
                     if entry_time is not None and exit_time is None:
-                        # Currently "inside" -> auto-mark exit here too,
-                        # same as before. Now safe alongside the dedicated
-                        # /mark-exit route because attendance_write_lock
-                        # serializes both, so only one can actually write
-                        # even if both cameras see the person at once.
                         if seconds_since(entry_time) < COOLDOWN_SECONDS:
                             face_result['status'] = 'already_marked'
                             face_result['action'] = 'entry'
@@ -451,8 +489,6 @@ def mark_attendance():
                                 face_result['message'] = '👋 ' + name + ' - Exit marked! Time: ' + now_time
 
                     else:
-                        # Both entry & exit already done -> allow fresh re-entry,
-                        # but respect cooldown after the exit.
                         if exit_time is not None and seconds_since(exit_time) < COOLDOWN_SECONDS:
                             face_result['status'] = 'already_marked'
                             face_result['action'] = 'exit'
@@ -477,7 +513,16 @@ def mark_attendance():
             results.append(face_result)
 
         conn.close()
-        return jsonify({'faces': results})
+
+        # Check for after-hours / intrusion window
+        after_hours_alert, alert_person = process_after_hours_check(results, camera_source="Webcam")
+
+        return jsonify({
+            'faces': results,
+            'fire_alert': fire_alert,
+            'fire_boxes': fire_boxes,
+            'after_hours_alert': after_hours_alert
+        })
 
     except Exception as e:
         print(e)
@@ -616,29 +661,493 @@ def mark_exit():
 
 
 # ---------------------------------------------------------------------------
-# RTSP mobile-camera integration for the Exit station.
-#
-# Instead of the browser capturing frames from a webcam, a phone running an
-# app like "IP Webcam" streams RTSP video directly to this server. A
-# background thread continuously reads frames from that stream and runs
-# them through the exact same process_exit_image() pipeline used above.
-# The exit page just polls /exit-camera/status to show the latest result —
-# it doesn't touch the camera itself at all.
+# RTSP mobile-camera integration & Frame Grabber
 # ---------------------------------------------------------------------------
+
+class RTSPFrameGrabber:
+    """Daemon thread frame grabber for OpenCV RTSP stream. Continuously reads
+    frames in a tight loop and keeps only the latest frame to eliminate buffer lag."""
+    def __init__(self, rtsp_url, transport="tcp"):
+        self.rtsp_url = rtsp_url
+        self.transport = transport
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = f"rtsp_transport;{transport}"
+        self.cap = cv2.VideoCapture(rtsp_url)
+        # Set buffer size to 1 as specified in requirement 2
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.lock = threading.Lock()
+        self.latest_frame = None
+        self.stopped = False
+        self.thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self.thread.start()
+
+    def _reader_loop(self):
+        while not self.stopped:
+            if not self.cap.isOpened():
+                time.sleep(0.05)
+                continue
+            success, frame = self.cap.read()
+            if success and frame is not None:
+                with self.lock:
+                    self.latest_frame = frame
+            else:
+                time.sleep(0.01)
+
+    def read(self):
+        with self.lock:
+            if self.latest_frame is None:
+                return False, None
+            return True, self.latest_frame.copy()
+
+    def isOpened(self):
+        return self.cap.isOpened()
+
+    def stop(self):
+        self.stopped = True
+        if self.thread.is_alive():
+            self.thread.join(timeout=1.0)
+        if self.cap:
+            self.cap.release()
+
+
+# ---- YOLO Fire/Smoke Detection Setup ----
+fire_model = None
+try:
+    from ultralytics import YOLO
+    if os.path.exists('models/best.pt'):
+        fire_model = YOLO('models/best.pt')
+        print("Loaded fine-tuned YOLO fire/smoke model from models/best.pt")
+    else:
+        print("Warning: models/best.pt not found.")
+except Exception as e:
+    print("Warning: Could not load ultralytics YOLO model:", e)
+
+
+fire_alert_tracker = {
+    'last_logged_time': 0.0,
+    'last_detected_time': 0.0,
+    'lock': threading.Lock()
+}
+
+FIRE_LOG_COOLDOWN = 60.0  # seconds between logging new fire_alerts DB rows
+FIRE_RESET_GAP = 5.0      # seconds gap of no fire before treating next fire as a new event
+
+
+# ---- External Alert Notifications (Email & Twilio SMS/WhatsApp) ----
+
+# ---- External Alert Notifications (Email & Twilio SMS/WhatsApp) ----
+
+def send_external_fire_alerts(timestamp_str, confidence, label, camera_source):
+    """Dispatches Email (Resend/SendGrid) and SMS/WhatsApp (Twilio) alerts
+    in an asynchronous background thread so external network calls never block
+    or slow down the live vision processing loops."""
+    print(f"[ALERT] send_external_fire_alerts() invoked for source: '{camera_source}' at {timestamp_str} (Conf: {confidence})", flush=True)
+    thread = threading.Thread(
+        target=_send_alerts_worker,
+        args=(timestamp_str, confidence, label, camera_source),
+        daemon=True
+    )
+    thread.start()
+
+
+def _send_alerts_worker(timestamp_str, confidence, label, camera_source):
+    print(f"[ALERT WORKER] Fire alert thread started for source '{camera_source}'", flush=True)
+    alert_email = os.environ.get('ALERT_EMAIL')
+    alert_phone = os.environ.get('ALERT_PHONE')
+
+    # 1. EMAIL ALERT (via Resend or SendGrid API)
+    if alert_email:
+        resend_key = os.environ.get('RESEND_API_KEY')
+        sendgrid_key = os.environ.get('SENDGRID_API_KEY')
+
+        if resend_key:
+            print(f"[ALERT] Attempting to send Email via Resend to {alert_email}...", flush=True)
+            try:
+                import resend
+                resend.api_key = resend_key
+                from_email = os.environ.get('RESEND_FROM_EMAIL', 'onboarding@resend.dev')
+                r = resend.Emails.send({
+                    "from": from_email,
+                    "to": [alert_email],
+                    "subject": "🔥 Fire/Smoke Detected",
+                    "html": f"""
+                    <h2>🔥 Emergency Fire / Smoke Alert</h2>
+                    <p>An emergency fire/smoke event has been detected by SentinelVision AI system.</p>
+                    <ul>
+                        <li><strong>Timestamp:</strong> {timestamp_str}</li>
+                        <li><strong>Camera Source:</strong> {camera_source}</li>
+                        <li><strong>Detected Class:</strong> {label}</li>
+                        <li><strong>Confidence Score:</strong> {confidence * 100:.1f}%</li>
+                    </ul>
+                    <p>Please inspect the premises immediately and take necessary safety precautions.</p>
+                    """
+                })
+                print(f"[ALERT SUCCESS] Resend Email alert sent successfully to {alert_email}. Response: {r}", flush=True)
+            except Exception as e_resend:
+                print(f"[ALERT ERROR] Failed to send Resend email alert to {alert_email}: {e_resend}", flush=True)
+
+        elif sendgrid_key:
+            print(f"[ALERT] Attempting to send Email via SendGrid to {alert_email}...", flush=True)
+            try:
+                import requests
+                headers = {
+                    "Authorization": f"Bearer {sendgrid_key}",
+                    "Content-Type": "application/json"
+                }
+                from_email = os.environ.get('SENDGRID_FROM_EMAIL', 'alerts@sentinelvision.ai')
+                data = {
+                    "personalizations": [{"to": [{"email": alert_email}]}],
+                    "from": {"email": from_email},
+                    "subject": "🔥 Fire/Smoke Detected",
+                    "content": [{
+                        "type": "text/html",
+                        "value": f"<p>🔥 <strong>Fire/Smoke Detected</strong> at {timestamp_str} on {camera_source} (Conf: {confidence * 100:.1f}%).</p>"
+                    }]
+                }
+                res = requests.post("https://api.sendgrid.com/v3/mail/send", json=data, headers=headers, timeout=10)
+                print(f"[ALERT SUCCESS] SendGrid email alert status code: {res.status_code}", flush=True)
+            except Exception as e_sg:
+                print(f"[ALERT ERROR] Failed to send SendGrid email alert to {alert_email}: {e_sg}", flush=True)
+        else:
+            print(f"[ALERT NOTICE] ALERT_EMAIL is set ({alert_email}), but neither RESEND_API_KEY nor SENDGRID_API_KEY is configured in .env.", flush=True)
+    else:
+        print(f"[ALERT NOTICE] External email alert skipped (ALERT_EMAIL environment variable not set in .env).", flush=True)
+
+    # 2. SMS & WHATSAPP ALERTS (via Twilio API)
+    if alert_phone:
+        twilio_sid = os.environ.get('TWILIO_ACCOUNT_SID')
+        twilio_token = os.environ.get('TWILIO_AUTH_TOKEN')
+        twilio_from = os.environ.get('TWILIO_PHONE_NUMBER')
+        twilio_wa_from = os.environ.get('TWILIO_WHATSAPP_NUMBER', 'whatsapp:+14155238886')
+
+        if twilio_sid and twilio_token:
+            sms_body = f"🔥 FIRE ALERT: {label.upper()} detected at {timestamp_str} on {camera_source} (Conf: {confidence*100:.0f}%). Inspect immediately!"
+            if len(sms_body) > 160:
+                sms_body = sms_body[:157] + "..."
+
+            if twilio_from:
+                print(f"[ALERT] Attempting to send Twilio SMS to {alert_phone}...", flush=True)
+                try:
+                    from twilio.rest import Client
+                    client = Client(twilio_sid, twilio_token)
+                    sms_msg = client.messages.create(
+                        body=sms_body,
+                        from_=twilio_from,
+                        to=alert_phone
+                    )
+                    print(f"[ALERT SUCCESS] Twilio SMS alert sent to {alert_phone} (SID: {sms_msg.sid})", flush=True)
+                except Exception as e_sms:
+                    print(f"[ALERT ERROR] Failed to send Twilio SMS alert to {alert_phone}: {e_sms}", flush=True)
+            else:
+                print(f"[ALERT NOTICE] TWILIO_PHONE_NUMBER not set in .env; skipping SMS.", flush=True)
+
+            wa_to = alert_phone if alert_phone.startswith('whatsapp:') else f"whatsapp:{alert_phone}"
+            print(f"[ALERT] Attempting to send Twilio WhatsApp to {wa_to}...", flush=True)
+            try:
+                from twilio.rest import Client
+                client = Client(twilio_sid, twilio_token)
+                wa_body = f"🔥 *EMERGENCY FIRE ALERT*\n\nFire/Smoke detected at *{timestamp_str}* on *{camera_source}*\nConfidence: *{confidence*100:.1f}%*\n\nPlease take immediate safety precautions."
+                wa_msg = client.messages.create(
+                    body=wa_body,
+                    from_=twilio_wa_from,
+                    to=wa_to
+                )
+                print(f"[ALERT SUCCESS] Twilio WhatsApp alert sent to {wa_to} (SID: {wa_msg.sid})", flush=True)
+            except Exception as e_wa:
+                print(f"[ALERT ERROR] Failed to send Twilio WhatsApp alert to {wa_to}: {e_wa}", flush=True)
+        else:
+            print(f"[ALERT NOTICE] ALERT_PHONE is set ({alert_phone}), but TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN environment variables not configured in .env.", flush=True)
+    else:
+        print(f"[ALERT NOTICE] External SMS/WhatsApp alert skipped (ALERT_PHONE environment variable not set in .env).", flush=True)
+
+
+# ---- After-Hours / Restricted Time-Window Intrusion Detection ----
+
+after_hours_alert_tracker = {
+    'last_logged_time': 0.0,
+    'lock': threading.Lock()
+}
+
+AFTER_HOURS_LOG_COOLDOWN = 60.0  # seconds between logging after-hours alerts per camera event cycle
+
+
+def is_in_restricted_window():
+    """Checks if the current server local time falls within the configured
+    RESTRICTED_START and RESTRICTED_END time window.
+    Default test window: RESTRICTED_START='15:25' (3:25 PM today).
+    Supports open-ended ('after HH:MM') or overnight ranges ('22:00' to '06:00')."""
+    start_str = (os.environ.get('RESTRICTED_START') or '15:25').strip()
+    end_str = (os.environ.get('RESTRICTED_END') or '').strip()
+
+    if not start_str:
+        return False
+
+    now_t = datetime.now().time()
+
+    try:
+        start_t = datetime.strptime(start_str, "%H:%M").time()
+    except Exception as e:
+        print("Invalid RESTRICTED_START format in .env (expected HH:MM):", start_str, e)
+        return False
+
+    if end_str:
+        try:
+            end_t = datetime.strptime(end_str, "%H:%M").time()
+            if start_t <= end_t:
+                return start_t <= now_t <= end_t
+            else:
+                # Overnight window (e.g. 22:00 -> 06:00)
+                return now_t >= start_t or now_t <= end_t
+        except Exception:
+            pass
+
+    # Open-ended ("after start_t")
+    return now_t >= start_t
+
+
+def process_after_hours_check(faces, camera_source="Unknown", force_check=False):
+    """If current time is inside the restricted window and faces are detected (recognized or unrecognized),
+    logs event to after_hours_alerts DB table and dispatches Email/SMS/WhatsApp alerts.
+    Respects 60-second cooldown."""
+    if not faces:
+        return False, None
+
+    in_window = force_check or is_in_restricted_window()
+    if not in_window:
+        return False, None
+
+    now = time.time()
+    should_log = False
+    with after_hours_alert_tracker['lock']:
+        if (now - after_hours_alert_tracker['last_logged_time']) >= AFTER_HOURS_LOG_COOLDOWN:
+            should_log = True
+            after_hours_alert_tracker['last_logged_time'] = now
+
+    if not should_log:
+        return True, "Suppressed by 60s cooldown"
+
+    timestamp_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    top_conf = 0.0
+    names = []
+    for f in faces:
+        name = f.get('name') or 'Unrecognized Person'
+        roll = f.get('roll_no')
+        conf = float(f.get('confidence') or f.get('det_score') or 0.88)
+        if conf > top_conf:
+            top_conf = conf
+        if name and name != 'Unknown':
+            names.append(f"{name} (ID: {roll})" if roll else name)
+        else:
+            names.append("Unrecognized Person")
+
+    person_summary = ", ".join(names) if names else "Unrecognized Person"
+
+    try:
+        conn = sqlite3.connect('database.db', timeout=10)
+        c = conn.cursor()
+        c.execute(
+            'INSERT INTO after_hours_alerts (timestamp, person_name, confidence, camera_source) VALUES (?, ?, ?, ?)',
+            (timestamp_str, person_summary, round(top_conf, 2), camera_source)
+        )
+        conn.commit()
+        conn.close()
+        print(f"[{timestamp_str}] ⚠️ AFTER-HOURS INTRUSION ALERT: Person detected ({person_summary}, Conf: {top_conf*100:.0f}%) from {camera_source}")
+    except Exception as e:
+        print("After-hours DB insert error:", e)
+
+    # Dispatch external Email, SMS & WhatsApp alerts asynchronously
+    send_external_after_hours_alerts(timestamp_str, person_summary, top_conf, camera_source)
+    return True, person_summary
+
+
+def send_external_after_hours_alerts(timestamp_str, person_summary, confidence, camera_source):
+    """Dispatches after-hours Email, SMS & WhatsApp alerts in a non-blocking background thread."""
+    print(f"[ALERT] send_external_after_hours_alerts() invoked for source: '{camera_source}' at {timestamp_str} (Person: {person_summary}, Conf: {confidence})", flush=True)
+    thread = threading.Thread(
+        target=_send_after_hours_alerts_worker,
+        args=(timestamp_str, person_summary, confidence, camera_source),
+        daemon=True
+    )
+    thread.start()
+
+
+def _send_after_hours_alerts_worker(timestamp_str, person_summary, confidence, camera_source):
+    print(f"[ALERT WORKER] After-hours alert thread started for source '{camera_source}'", flush=True)
+    alert_email = os.environ.get('ALERT_EMAIL')
+    alert_phone = os.environ.get('ALERT_PHONE')
+
+    # 1. EMAIL ALERT
+    if alert_email:
+        resend_key = os.environ.get('RESEND_API_KEY')
+        sendgrid_key = os.environ.get('SENDGRID_API_KEY')
+
+        if resend_key:
+            print(f"[ALERT] Attempting to send after-hours Email via Resend to {alert_email}...", flush=True)
+            try:
+                import resend
+                resend.api_key = resend_key
+                from_email = os.environ.get('RESEND_FROM_EMAIL', 'onboarding@resend.dev')
+                r = resend.Emails.send({
+                    "from": from_email,
+                    "to": [alert_email],
+                    "subject": "⚠️ Person Detected After Hours",
+                    "html": f"""
+                    <h2>⚠️ Intrusion / After-Hours Alert</h2>
+                    <p>A person has been detected on camera during the configured restricted time window.</p>
+                    <ul>
+                        <li><strong>Timestamp:</strong> {timestamp_str}</li>
+                        <li><strong>Camera Source:</strong> {camera_source}</li>
+                        <li><strong>Person Identified:</strong> {person_summary}</li>
+                        <li><strong>Confidence Score:</strong> {confidence * 100:.1f}%</li>
+                    </ul>
+                    <p>Please inspect camera feeds and verify facility security immediately.</p>
+                    """
+                })
+                print(f"[ALERT SUCCESS] After-hours Email alert sent to {alert_email} via Resend. Response: {r}", flush=True)
+            except Exception as e:
+                print(f"[ALERT ERROR] Failed to send Resend after-hours email to {alert_email}: {e}", flush=True)
+
+        elif sendgrid_key:
+            print(f"[ALERT] Attempting to send after-hours Email via SendGrid to {alert_email}...", flush=True)
+            try:
+                import requests
+                headers = {"Authorization": f"Bearer {sendgrid_key}", "Content-Type": "application/json"}
+                from_email = os.environ.get('SENDGRID_FROM_EMAIL', 'alerts@sentinelvision.ai')
+                data = {
+                    "personalizations": [{"to": [{"email": alert_email}]}],
+                    "from": {"email": from_email},
+                    "subject": "⚠️ Person Detected After Hours",
+                    "content": [{"type": "text/html", "value": f"<p>⚠️ <strong>Person Detected After Hours</strong> ({person_summary}) at {timestamp_str} on {camera_source}.</p>"}]
+                }
+                res = requests.post("https://api.sendgrid.com/v3/mail/send", json=data, headers=headers, timeout=10)
+                print(f"[ALERT SUCCESS] SendGrid after-hours email status code: {res.status_code}", flush=True)
+            except Exception as e:
+                print(f"[ALERT ERROR] Failed to send SendGrid after-hours email to {alert_email}: {e}", flush=True)
+        else:
+            print(f"[ALERT NOTICE] ALERT_EMAIL is set ({alert_email}), but neither RESEND_API_KEY nor SENDGRID_API_KEY is configured in .env.", flush=True)
+    else:
+        print(f"[ALERT NOTICE] After-hours email alert skipped (ALERT_EMAIL environment variable not set in .env).", flush=True)
+
+    # 2. SMS & WHATSAPP ALERTS (Twilio)
+    if alert_phone:
+        twilio_sid = os.environ.get('TWILIO_ACCOUNT_SID')
+        twilio_token = os.environ.get('TWILIO_AUTH_TOKEN')
+        twilio_from = os.environ.get('TWILIO_PHONE_NUMBER')
+        twilio_wa_from = os.environ.get('TWILIO_WHATSAPP_NUMBER', 'whatsapp:+14155238886')
+
+        if twilio_sid and twilio_token:
+            sms_body = f"⚠️ AFTER HOURS ALERT: {person_summary} detected at {timestamp_str} on {camera_source}. Inspect immediately!"
+            if len(sms_body) > 160:
+                sms_body = sms_body[:157] + "..."
+
+            if twilio_from:
+                print(f"[ALERT] Attempting to send after-hours Twilio SMS to {alert_phone}...", flush=True)
+                try:
+                    from twilio.rest import Client
+                    client = Client(twilio_sid, twilio_token)
+                    sms_msg = client.messages.create(body=sms_body, from_=twilio_from, to=alert_phone)
+                    print(f"[ALERT SUCCESS] Twilio after-hours SMS sent to {alert_phone} (SID: {sms_msg.sid})", flush=True)
+                except Exception as e:
+                    print(f"[ALERT ERROR] Failed to send Twilio after-hours SMS to {alert_phone}: {e}", flush=True)
+            else:
+                print(f"[ALERT NOTICE] TWILIO_PHONE_NUMBER not set in .env; skipping SMS.", flush=True)
+
+            wa_to = alert_phone if alert_phone.startswith('whatsapp:') else f"whatsapp:{alert_phone}"
+            print(f"[ALERT] Attempting to send after-hours Twilio WhatsApp to {wa_to}...", flush=True)
+            try:
+                from twilio.rest import Client
+                client = Client(twilio_sid, twilio_token)
+                wa_body = f"⚠️ *AFTER HOURS INTRUSION ALERT*\n\nPerson Detected: *{person_summary}*\nTimestamp: *{timestamp_str}*\nCamera: *{camera_source}*\n\nPlease verify facility security immediately."
+                wa_msg = client.messages.create(body=wa_body, from_=twilio_wa_from, to=wa_to)
+                print(f"[ALERT SUCCESS] Twilio after-hours WhatsApp sent to {wa_to} (SID: {wa_msg.sid})", flush=True)
+            except Exception as e:
+                print(f"[ALERT ERROR] Failed to send Twilio after-hours WhatsApp to {wa_to}: {e}", flush=True)
+        else:
+            print(f"[ALERT NOTICE] ALERT_PHONE is set ({alert_phone}), but TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN environment variables not configured in .env.", flush=True)
+    else:
+        print(f"[ALERT NOTICE] After-hours SMS/WhatsApp alert skipped (ALERT_PHONE environment variable not set in .env).", flush=True)
+
+
+def run_fire_detection(frame_bgr, conf_thresh=0.50, camera_source="Unknown", force_log=False):
+    """Runs YOLO fire/smoke inference on frame_bgr (OpenCV format).
+    Returns (detections, fire_found).
+    Logs event to fire_alerts DB table with 60-second cooldown / 5s reset gap
+    and triggers asynchronous external Email, SMS & WhatsApp notifications."""
+    if fire_model is None or frame_bgr is None:
+        return [], False
+
+    try:
+        results = fire_model(frame_bgr, conf=conf_thresh, verbose=False)
+        detections = []
+        fire_found = False
+
+        if results and len(results) > 0:
+            boxes = results[0].boxes
+            for box in boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                conf = float(box.conf[0])
+                cls_id = int(box.cls[0])
+                label = results[0].names.get(cls_id, "fire")
+                detections.append({
+                    'box': [x1, y1, x2, y2],
+                    'confidence': round(conf, 2),
+                    'label': label
+                })
+                fire_found = True
+
+        if fire_found:
+            now = time.time()
+            should_log = force_log
+            with fire_alert_tracker['lock']:
+                last_logged = fire_alert_tracker['last_logged_time']
+                last_detected = fire_alert_tracker['last_detected_time']
+
+                if force_log or (now - last_logged >= FIRE_LOG_COOLDOWN) or (now - last_detected >= FIRE_RESET_GAP):
+                    should_log = True
+                    fire_alert_tracker['last_logged_time'] = now
+
+                fire_alert_tracker['last_detected_time'] = now
+
+            if should_log and detections:
+                timestamp_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                top_conf = max(d['confidence'] for d in detections)
+                top_label = detections[0]['label']
+
+                try:
+                    conn = sqlite3.connect('database.db', timeout=10)
+                    c = conn.cursor()
+                    c.execute(
+                        'INSERT INTO fire_alerts (timestamp, confidence, label, camera_source) VALUES (?, ?, ?, ?)',
+                        (timestamp_str, top_conf, top_label, camera_source)
+                    )
+                    conn.commit()
+                    conn.close()
+                    print(f"[{timestamp_str}] Fire alert logged to database from {camera_source}")
+                except Exception as db_err:
+                    print("Fire alert DB insert error:", db_err)
+
+                # Send external Email, SMS, and WhatsApp alerts asynchronously
+                send_external_fire_alerts(timestamp_str, top_conf, top_label, camera_source)
+
+        return detections, fire_found
+
+    except Exception as err:
+        print("Fire detection inference error:", err)
+        return [], False
+
 
 exit_camera_lock = threading.Lock()
 exit_camera_state = {
     'running': False,
+    'grabber': None,
     'thread': None,
     'stop_event': None,
     'latest': {'faces': [], 'message': 'Exit camera not started yet.'}
 }
 
 
-def exit_camera_worker(rtsp_url, stop_event):
-    cap = cv2.VideoCapture(rtsp_url)
-
-    if not cap.isOpened():
+def exit_camera_worker(grabber, stop_event):
+    if not grabber.isOpened():
         with exit_camera_lock:
             exit_camera_state['latest'] = {
                 'faces': [],
@@ -650,33 +1159,85 @@ def exit_camera_worker(rtsp_url, stop_event):
     FAST_INTERVAL = 0.25    # seconds between runs while waiting on a blink
     current_interval = NORMAL_INTERVAL
     last_processed = 0.0
+    frame_counter = 0
+    latest_fire_boxes = []
+    latest_fire_alert = False
 
     try:
         while not stop_event.is_set():
-            success, frame_bgr = cap.read()
-            if not success:
-                time.sleep(0.2)
+            success, frame_bgr = grabber.read()
+            if not success or frame_bgr is None:
+                time.sleep(0.05)
                 continue
 
             now = time.time()
             if now - last_processed < current_interval:
-                continue  # keep draining the stream, but skip heavy processing this frame
+                time.sleep(0.01)
+                continue  # Skip heavy processing this frame
 
             last_processed = now
+            frame_counter += 1
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+            # Fire detection run every 3rd frame as requested in Part 2 requirement 2
+            if frame_counter % 3 == 0 or frame_counter == 1:
+                latest_fire_boxes, latest_fire_alert = run_fire_detection(frame_bgr, conf_thresh=0.50, camera_source="RTSP Exit Camera")
 
             try:
                 result = process_exit_image(frame_rgb)
             except Exception as e:
                 result = {'faces': [], 'error': str(e)}
 
+            result['fire_alert'] = latest_fire_alert
+            result['fire_boxes'] = latest_fire_boxes
+
+            if result.get('faces'):
+                ah_alert, _ = process_after_hours_check(result['faces'], camera_source="RTSP Exit Camera")
+                result['after_hours_alert'] = ah_alert
+
             any_pending = any(f.get('status') == 'liveness_pending' for f in result.get('faces', []))
             current_interval = FAST_INTERVAL if any_pending else NORMAL_INTERVAL
+
+            # Generate live snapshot preview frame with face and fire bounding box overlays
+            try:
+                snapshot = frame_bgr.copy()
+
+                # 1. Draw Face boxes
+                for face in result.get('faces', []):
+                    if 'box' in face:
+                        top, right, bottom, left = face['box']
+                        color = (255, 107, 107) # BGR
+                        if face.get('status') == 'marked':
+                            color = (246, 130, 59)
+                        elif face.get('status') == 'already_exited':
+                            color = (11, 158, 245)
+                        cv2.rectangle(snapshot, (left, top), (right, bottom), color, 2)
+                        label = face.get('name', 'Unknown')
+                        cv2.putText(snapshot, label, (left, max(top - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+                # 2. Draw Fire boxes (in red BGR)
+                for fbox in latest_fire_boxes:
+                    if 'box' in fbox:
+                        x1, y1, x2, y2 = fbox['box']
+                        cv2.rectangle(snapshot, (x1, y1), (x2, y2), (0, 0, 255), 3)
+                        flabel = f"🔥 {fbox.get('label', 'fire')} ({fbox.get('confidence', 0.0):.2f})"
+                        cv2.putText(snapshot, flabel, (x1, max(y1 - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+                h, w = snapshot.shape[:2]
+                if w > 640:
+                    new_h = int(h * (640 / w))
+                    snapshot = cv2.resize(snapshot, (640, new_h))
+
+                ret, buffer = cv2.imencode('.jpg', snapshot, [cv2.IMWRITE_JPEG_QUALITY, 65])
+                if ret:
+                    result['frame'] = 'data:image/jpeg;base64,' + base64.b64encode(buffer).decode('utf-8')
+            except Exception as snap_err:
+                print('Snapshot encode error:', snap_err)
 
             with exit_camera_lock:
                 exit_camera_state['latest'] = result
     finally:
-        cap.release()
+        grabber.stop()
 
 
 @app.route('/exit-camera/start', methods=['POST'])
@@ -684,6 +1245,7 @@ def exit_camera_worker(rtsp_url, stop_event):
 def start_exit_camera():
     data = request.get_json(silent=True) or {}
     rtsp_url = (data.get('rtsp_url') or '').strip()
+    transport = (data.get('transport') or 'tcp').strip().lower()
 
     if not rtsp_url:
         return jsonify({'success': False, 'message': 'RTSP URL is required.'})
@@ -692,15 +1254,21 @@ def start_exit_camera():
         if exit_camera_state['running']:
             return jsonify({'success': False, 'message': 'Exit camera is already running.'})
 
+        try:
+            grabber = RTSPFrameGrabber(rtsp_url, transport=transport)
+        except Exception as e:
+            return jsonify({'success': False, 'message': f'Failed to open RTSP stream ({transport}): {str(e)}'})
+
         stop_event = threading.Event()
-        thread = threading.Thread(target=exit_camera_worker, args=(rtsp_url, stop_event), daemon=True)
+        thread = threading.Thread(target=exit_camera_worker, args=(grabber, stop_event), daemon=True)
+        exit_camera_state['grabber'] = grabber
         exit_camera_state['stop_event'] = stop_event
         exit_camera_state['thread'] = thread
         exit_camera_state['running'] = True
-        exit_camera_state['latest'] = {'faces': [], 'message': 'Connecting to camera...'}
+        exit_camera_state['latest'] = {'faces': [], 'message': f'Connecting to RTSP stream via {transport.upper()}...'}
         thread.start()
 
-    return jsonify({'success': True, 'message': 'Exit camera starting...'})
+    return jsonify({'success': True, 'message': f'Exit camera starting ({transport.upper()})...'})
 
 
 @app.route('/exit-camera/stop', methods=['POST'])
@@ -711,6 +1279,8 @@ def stop_exit_camera():
             return jsonify({'success': False, 'message': 'Exit camera is not running.'})
 
         exit_camera_state['stop_event'].set()
+        if exit_camera_state.get('grabber'):
+            exit_camera_state['grabber'].stop()
         exit_camera_state['running'] = False
         exit_camera_state['latest'] = {'faces': [], 'message': 'Camera stopped.'}
 
@@ -731,14 +1301,20 @@ def dashboard():
     conn = sqlite3.connect('database.db', timeout=10)
     c = conn.cursor()
     query = """
-        SELECT attendance.id, students.name, students.roll_no, students.class,
+        SELECT attendance.id, 
+               COALESCE(students.name, '[Deleted Student]'), 
+               COALESCE(students.roll_no, 'N/A'), 
+               COALESCE(students.class, 'N/A'),
                attendance.date, attendance.entry_time, attendance.exit_time, attendance.status
         FROM attendance
-        JOIN students ON attendance.student_id = students.id
+        LEFT JOIN students ON attendance.student_id = students.id
         ORDER BY attendance.date DESC, attendance.entry_time DESC
     """
     c.execute(query)
     records = c.fetchall()
+
+    c.execute('SELECT id, name, roll_no, class FROM students ORDER BY name ASC')
+    students_list = c.fetchall()
 
     # ---- Dashboard statistics (today only) ----
     today = datetime.now().strftime('%Y-%m-%d')
@@ -783,7 +1359,7 @@ def dashboard():
         'completed_day': completed_day,
     }
 
-    return render_template('dashboard.html', records=records, stats=stats)
+    return render_template('dashboard.html', records=records, stats=stats, students_list=students_list)
 
 
 @app.route('/export-attendance')
@@ -794,10 +1370,12 @@ def export_attendance():
         conn = sqlite3.connect('database.db', timeout=10)
         c = conn.cursor()
         query = """
-            SELECT students.roll_no, students.name, students.class,
+            SELECT COALESCE(students.roll_no, 'N/A'), 
+                   COALESCE(students.name, '[Deleted Student]'), 
+                   COALESCE(students.class, 'N/A'),
                    attendance.date, attendance.entry_time, attendance.exit_time, attendance.status
             FROM attendance
-            JOIN students ON attendance.student_id = students.id
+            LEFT JOIN students ON attendance.student_id = students.id
             ORDER BY attendance.date DESC, attendance.entry_time DESC
         """
         c.execute(query)
@@ -861,6 +1439,24 @@ def delete_attendance(attendance_id):
         return jsonify({'success': False, 'message': str(e)})
 
 
+@app.route('/delete-student/<int:student_id>', methods=['POST'])
+@login_required
+def delete_student(student_id):
+    """Deletes a single student's registered face embedding and profile
+    from the students table. Existing attendance records remain intact
+    in the database and show as [Deleted Student] on the dashboard/export
+    for audit trail preservation."""
+    try:
+        conn = sqlite3.connect('database.db', timeout=10)
+        c = conn.cursor()
+        c.execute('DELETE FROM students WHERE id = ?', (student_id,))
+        conn.commit()
+        conn.close()
+        return jsonify({'success': True, 'message': 'Student profile and face data deleted successfully.'})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)})
+
+
 @app.route('/delete-all-attendance', methods=['POST'])
 @login_required
 def delete_all_attendance():
@@ -896,6 +1492,138 @@ def delete_all_students():
         return jsonify({'success': False, 'message': str(e)})
 
 
+@app.route('/api/test-fire', methods=['GET', 'POST'])
+def test_fire_endpoint():
+    """Test Mode Endpoint (Part 2 requirement 6): Runs fire detection on
+    test_fire.jpg (or uploaded image/frame), generates red bounding box
+    snapshot, triggers DB log entry, and returns payload to test UI alarm."""
+    try:
+        data = request.get_json(silent=True) or {}
+        image_data = data.get('image')
+
+        if image_data:
+            img_bgr = decode_base64_image(image_data)
+            # convert RGB from PIL back to BGR for cv2 drawing
+            img_bgr = cv2.cvtColor(img_bgr, cv2.COLOR_RGB2BGR)
+        else:
+            test_path = os.path.join(os.path.dirname(__file__), 'test_fire_clear.jpg')
+            if not os.path.exists(test_path):
+                test_path = os.path.join(os.path.dirname(__file__), 'test_fire.jpg')
+            if not os.path.exists(test_path):
+                return jsonify({'success': False, 'error': 'Test fire image not found on server.'})
+            img_bgr = cv2.imread(test_path)
+
+        if img_bgr is None:
+            return jsonify({'success': False, 'error': 'Could not decode test image.'})
+
+        fire_boxes, fire_alert = run_fire_detection(img_bgr, conf_thresh=0.50, camera_source="Test Mode", force_log=True)
+
+        # Draw red bounding boxes for preview
+        snapshot = img_bgr.copy()
+        for fbox in fire_boxes:
+            if 'box' in fbox:
+                x1, y1, x2, y2 = fbox['box']
+                cv2.rectangle(snapshot, (x1, y1), (x2, y2), (0, 0, 255), 3)
+                flabel = f"🔥 {fbox.get('label', 'fire')} ({fbox.get('confidence', 0.0):.2f})"
+                cv2.putText(snapshot, flabel, (x1, max(y1 - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+        h, w = snapshot.shape[:2]
+        if w > 640:
+            new_h = int(h * (640 / w))
+            snapshot = cv2.resize(snapshot, (640, new_h))
+
+        ret, buffer = cv2.imencode('.jpg', snapshot, [cv2.IMWRITE_JPEG_QUALITY, 75])
+        frame_base64 = ''
+        if ret:
+            frame_base64 = 'data:image/jpeg;base64,' + base64.b64encode(buffer).decode('utf-8')
+
+        return jsonify({
+            'success': True,
+            'fire_alert': fire_alert,
+            'fire_boxes': fire_boxes,
+            'frame': frame_base64,
+            'message': f"Detection completed: {len(fire_boxes)} fire/smoke region(s) found." if fire_alert else "No fire detected in test image."
+        })
+    except Exception as e:
+        print("Test fire endpoint error:", e)
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/fire-alerts', methods=['GET'])
+@login_required
+def get_fire_alerts():
+    """Retrieve logged fire alerts from database for dashboard viewing."""
+    try:
+        conn = sqlite3.connect('database.db', timeout=10)
+        c = conn.cursor()
+        c.execute('SELECT id, timestamp, confidence, label, camera_source FROM fire_alerts ORDER BY id DESC LIMIT 50')
+        rows = c.fetchall()
+        conn.close()
+
+        alerts = []
+        for r in rows:
+            alerts.append({
+                'id': r[0],
+                'timestamp': r[1],
+                'confidence': r[2],
+                'label': r[3],
+                'camera_source': r[4]
+            })
+        return jsonify({'success': True, 'alerts': alerts})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/test-after-hours', methods=['GET', 'POST'])
+def test_after_hours_endpoint():
+    """Test Mode Endpoint for After-Hours Intrusion Detection: Simulates a person
+    detected during the restricted window, logs row to after_hours_alerts DB,
+    and dispatches Email + SMS/WhatsApp alerts."""
+    try:
+        data = request.get_json(silent=True) or {}
+        person_name = data.get('person_name', 'Test Intruder / Employee')
+        roll_no = data.get('roll_no', 'TEST-888')
+
+        test_faces = [{'name': person_name, 'roll_no': roll_no}]
+        triggered, summary = process_after_hours_check(test_faces, camera_source="Test Mode", force_check=True)
+
+        return jsonify({
+            'success': True,
+            'after_hours_alert': triggered,
+            'person_summary': summary,
+            'message': f"After-hours intrusion test executed for {summary}. Email/SMS/WhatsApp dispatch initiated."
+        })
+    except Exception as e:
+        print("Test after-hours endpoint error:", e)
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/after-hours-alerts', methods=['GET'])
+@login_required
+def get_after_hours_alerts():
+    """Retrieve logged intrusion/after-hours alerts from database for dashboard viewing."""
+    try:
+        conn = sqlite3.connect('database.db', timeout=10)
+        c = conn.cursor()
+        c.execute('SELECT id, timestamp, person_name, confidence, camera_source FROM after_hours_alerts ORDER BY id DESC LIMIT 50')
+        rows = c.fetchall()
+        conn.close()
+
+        alerts = []
+        for r in rows:
+            alerts.append({
+                'id': r[0],
+                'timestamp': r[1],
+                'person_name': r[2],
+                'confidence': r[3],
+                'camera_source': r[4]
+            })
+        return jsonify({'success': True, 'alerts': alerts})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
 if __name__ == '__main__':
     print("Flask server ab start ho raha hai...")
     app.run(debug=True, threaded=True)
+
