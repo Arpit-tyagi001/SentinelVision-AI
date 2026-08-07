@@ -1,3 +1,14 @@
+<p align="center">
+
+# 📸 Face Attendance Recognition System
+
+![Python](https://img.shields.io/badge/Python-3.11-blue?logo=python)
+![Flask](https://img.shields.io/badge/Flask-Web%20Framework-black?logo=flask)
+![OpenCV](https://img.shields.io/badge/OpenCV-Computer%20Vision-green?logo=opencv)
+![SQLite](https://img.shields.io/badge/SQLite-Database-blue?logo=sqlite)
+![License](https://img.shields.io/badge/License-MIT-orange)
+
+</p>
 # 📸 Face Attendance Recognition System
 
 > **An AI-powered attendance management system that uses real-time face recognition to automatically identify registered students and maintain attendance records.**
